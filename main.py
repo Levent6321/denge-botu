@@ -113,12 +113,34 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
 # DÖNEM SINIRLARI (son TAMAMLANMIŞ hafta / ay / yarıyıl / yıl)
 # ----------------------------------------------------------------------------
  
-def get_last_completed_week_range(today: date):
-    """Hafta Pazartesi-Pazar kabul edilir. İçinde bulunduğumuz hafta kapanmamış sayılır."""
-    this_monday = today - timedelta(days=today.weekday())
-    last_monday = this_monday - timedelta(days=7)
-    last_sunday = last_monday + timedelta(days=6)
-    return last_monday, last_sunday
+def get_last_completed_week_range(today: date, is_crypto: bool = False):
+    """
+    Kripto (7 gün/hafta işlem görür): Hafta Pazartesi-Pazar kabul edilir.
+    İçinde bulunduğumuz hafta HENÜZ KAPANMAMIŞ sayılır.
+ 
+    Forex/emtia (Pazartesi-Cuma işlem görür): Hafta Pazartesi-Cuma kabul edilir.
+    Cuma kapanışından sonra (yani bugün Cumartesi veya Pazar ise) o haftanın
+    ARTIK TAMAMLANDIĞI kabul edilir ve o hafta gösterilir (bir hafta geriye
+    gitmeye gerek yoktur, çünkü Cuma akşamı piyasa zaten kapanmıştır).
+    """
+    weekday = today.weekday()  # 0=Pzt ... 4=Cuma, 5=Cmt, 6=Paz
+ 
+    if is_crypto:
+        this_monday = today - timedelta(days=weekday)
+        last_monday = this_monday - timedelta(days=7)
+        last_sunday = last_monday + timedelta(days=6)
+        return last_monday, last_sunday
+ 
+    if weekday >= 5:
+        # Bugün Cumartesi/Pazar -> bu haftanın Pzt-Cuma'sı zaten tamamlandı
+        week_monday = today - timedelta(days=weekday)
+    else:
+        # Bugün Pzt-Cuma arası -> bu hafta henüz bitmedi, önceki haftayı kullan
+        this_monday = today - timedelta(days=weekday)
+        week_monday = this_monday - timedelta(days=7)
+ 
+    week_friday = week_monday + timedelta(days=4)
+    return week_monday, week_friday
  
  
 def get_last_completed_month_range(today: date):
@@ -277,7 +299,8 @@ def calculate_all_periods(user_symbol: str) -> dict:
             results["Günlük"] = {"hata": str(e)}
  
         try:
-            start, end = get_last_completed_week_range(today)
+            is_crypto = _is_crypto_symbol(user_symbol)
+            start, end = get_last_completed_week_range(today, is_crypto=is_crypto)
             results["Haftalık"] = _levels_from_bars(_filter_by_range(daily_bars, start, end), birim="gün")
         except Exception as e:
             results["Haftalık"] = {"hata": str(e)}
@@ -422,4 +445,3 @@ def main():
  
 if __name__ == "__main__":
     main()
- 
