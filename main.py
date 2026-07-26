@@ -211,18 +211,28 @@ def _levels_from_bars(bars, birim: str = "gün") -> dict:
     mods = sorted([v for v, c in counts.items() if c >= 2])
     dates = sorted({_parse_bar_date(b) for b in bars})
  
+    destek1 = denge - half_range
+    destek2 = denge - range_
+ 
+    uyari = None
+    if destek2 < 0:
+        uyari = "⚠️ Bu dönem çok oynak; Destek 2 matematiksel olarak negatif çıktı (fiyatta gerçekleşemez)."
+    elif destek1 < 0:
+        uyari = "⚠️ Bu dönem çok oynak; Destek 1 matematiksel olarak negatif çıktı (fiyatta gerçekleşemez)."
+ 
     return {
         "denge": denge,
         "direnc1": denge + half_range,
         "direnc2": denge + range_,
-        "destek1": denge - half_range,
-        "destek2": denge - range_,
+        "destek1": destek1,
+        "destek2": destek2,
         "range": range_,
         "mod": mods,
         "adet": len(bars),
         "birim": birim,
         "baslangic": dates[0].isoformat(),
         "bitis": dates[-1].isoformat(),
+        "uyari": uyari,
     }
  
  
@@ -365,6 +375,9 @@ def format_period_block(period_name: str, result: dict) -> str:
     if result["mod"]:
         mod_str = ", ".join(f"{v:,.2f}" for v in result["mod"])
         lines.append(f"🔁 _Mod (tekrarlayan seviye): {mod_str}_")
+ 
+    if result.get("uyari"):
+        lines.append(f"_{result['uyari']}_")
  
     return "\n".join(lines)
  
