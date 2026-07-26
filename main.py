@@ -354,17 +354,18 @@ def format_period_block(period_name: str, result: dict) -> str:
     birim_etiketi = f"{result['adet']} {result['birim']}"
     tarih_araligi = f"{_format_tr_date(result['baslangic'])} → {_format_tr_date(result['bitis'])}"
  
-    def row(label: str, value: float) -> str:
-        return f"{label:<9}{value:>13,.2f}"
+    def row(label: str, value: float, emoji: str = "") -> str:
+        full_label = f"{emoji} {label}" if emoji else label
+        return f"{full_label:<11}{value:>11,.2f}"
  
     table = "\n".join([
-        row("Direnç 2", result["direnc2"]),
-        row("Direnç 1", result["direnc1"]),
+        row("Direnç 2", result["direnc2"], "🔴"),
+        row("Direnç 1", result["direnc1"], "🔴"),
         "─" * 22,
-        row("⚖ Denge", result["denge"]),
+        row("Denge", result["denge"], "🟣"),
         "─" * 22,
-        row("Destek 1", result["destek1"]),
-        row("Destek 2", result["destek2"]),
+        row("Destek 1", result["destek1"], "🔵"),
+        row("Destek 2", result["destek2"], "🔵"),
     ])
  
     lines = [
@@ -421,3 +422,4 @@ def main():
  
 if __name__ == "__main__":
     main()
+ 
