@@ -5,8 +5,10 @@ BTCUSD, XAUUSD, EURUSD gibi enstrümanlar için Günlük / Haftalık / Aylık /
 6 Aylık / Yıllık Denge, Direnç 1-2 ve Destek 1-2 seviyelerini hesaplar.
  
 YÖNTEM:
-  1) Dönemdeki HER GÜNÜN high ve low değeri tek tek alınır (N gün -> 2N sayı).
-  2) Denge = bu 2N sayının aritmetik ortalaması.
+  1) Dönemdeki HER GÜNÜN (ya da 6 Aylık/Yıllık için her HAFTANIN) high ve low
+     değeri tek tek alınır (N adet -> 2N sayı).
+  2) Denge = bu 2N sayının MEDYANI (aritmetik ortalama değil — uç değerlerden
+     daha az etkilenmesi için tercih edildi).
   3) Range = en yüksek değer - en düşük değer.
   4) Direnç 1 = Denge + Range*0.5    Direnç 2 = Denge + Range
      Destek 1  = Denge - Range*0.5    Destek 2  = Denge - Range
@@ -24,6 +26,7 @@ YÖNTEM:
  
 import os
 import logging
+import statistics
 from collections import Counter
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -44,9 +47,16 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
  
 TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
  
-# Tek seferde geriye dönük kaç GÜNLÜK mum çekileceği (800 gün ~ 2-3 yıl geriye gider,
-# "son tamamlanmış yıl" gibi en uzun dönem ihtiyacını bile karşılar).
-HISTORY_OUTPUTSIZE = 800
+# Twelve Data ücretsiz plan: dakikada 8 KREDİ (yaklaşık her 21 mum = 1 kredi).
+# Bu yüzden TEK seferde 800 mum çekmek (~39 kredi) limiti aşıyordu.
+# Çözüm: iki KÜÇÜK istek yapıyoruz:
+#   1) Günlük mumlarla KISA bir istek (Günlük/Haftalık/Aylık için yeterli)
+#   2) Haftalık mumlarla (daha az veri noktası) UZUN bir istek (6 Aylık/Yıllık için)
+# Bu ikisinin toplam kredi maliyeti her zaman ~8 kredinin altında kalacak şekilde
+# tarihe göre dinamik hesaplanır.
+CREDIT_BAR_UNIT = 21  # ~1 kredi = 21 mum (Twelve Data gözlemlenen davranışı)
+MAX_SHORT_DAILY_BARS = 60   # güvenlik tavanı (~3 kredi)
+MAX_LONG_WEEKLY_BARS = 95   # güvenlik tavanı (~5 kredi)
  
 PERIOD_NAMES = ["Günlük", "Haftalık", "Aylık", "6 Aylık", "Yıllık"]
  
@@ -74,15 +84,15 @@ def normalize_symbol(user_symbol: str) -> str:
     return s
  
  
-def fetch_daily_bars(user_symbol: str, outputsize: int):
-    """Son `outputsize` adet GÜNLÜK mumu Twelve Data'dan çeker."""
+def fetch_bars(user_symbol: str, interval: str, outputsize: int):
+    """Twelve Data'dan belirtilen aralıkta (1day / 1week) son `outputsize` mumu çeker."""
     if not TWELVE_DATA_API_KEY:
         raise ValueError("TWELVE_DATA_API_KEY tanımlı değil. Ortam değişkenlerini kontrol edin.")
  
     symbol = normalize_symbol(user_symbol)
     params = {
         "symbol": symbol,
-        "interval": "1day",
+        "interval": interval,
         "outputsize": outputsize,
         "apikey": TWELVE_DATA_API_KEY,
     }
@@ -145,32 +155,34 @@ def _filter_by_range(bars, start: date, end: date):
     return [b for b in bars if start <= _parse_bar_date(b) <= end]
  
  
-def _dedupe_weekend_bars(bars):
-    """
-    Bazı veri sağlayıcıları emtia/forex sembolleri için hafta sonuna (Cmt/Paz)
-    Cuma kapanışının BİREBİR AYNISI olan "hayalet" mumlar döndürebilir (gerçek
-    işlem olmamasına rağmen). Bu, ortalamayı (dengeyi) Cuma değerlerini fazladan
-    sayarak yanlış ağırlıklandırır.
+CRYPTO_BASES = {
+    "BTC", "ETH", "XRP", "LTC", "BCH", "ADA", "SOL", "DOGE", "DOT", "MATIC",
+    "BNB", "AVAX", "LINK", "TRX", "SHIB", "ATOM", "UNI", "XLM", "ETC", "FIL",
+    "APT", "ARB", "OP", "NEAR", "ICP", "AAVE", "SAND", "MANA", "ALGO", "VET",
+}
  
-    Bu fonksiyon: bir Cumartesi/Pazar mumu, kendisinden önceki en son hafta içi
-    mumla high VE low değerlerinde birebir aynıysa, gerçek işlem olmadığı kabul
-    edilip listeden çıkarılır. Kripto gibi gerçekten hafta sonu fiyatı değişen
-    semboller bundan etkilenmez, çünkü değerler eşleşmeyecektir.
+ 
+def _is_crypto_symbol(user_symbol: str) -> bool:
+    normalized = normalize_symbol(user_symbol)
+    base = normalized.split("/")[0].upper()
+    return base in CRYPTO_BASES
+ 
+ 
+def _filter_weekend_bars_if_not_crypto(bars, user_symbol: str):
     """
-    sorted_bars = sorted(bars, key=_parse_bar_date)
-    result = []
-    last_weekday_bar = None
-    for bar in sorted_bars:
-        d = _parse_bar_date(bar)
-        if d.weekday() >= 5 and last_weekday_bar is not None:
-            same_high = abs(float(bar["high"]) - float(last_weekday_bar["high"])) < 1e-9
-            same_low = abs(float(bar["low"]) - float(last_weekday_bar["low"])) < 1e-9
-            if same_high and same_low:
-                continue  # hayalet hafta sonu mumu, atla
-        result.append(bar)
-        if d.weekday() < 5:
-            last_weekday_bar = bar
-    return result
+    XAUUSD, EURUSD gibi forex/emtia sembolleri normalde Pazartesi-Cuma işlem görür.
+    Ancak bazı veri sağlayıcıları (Twelve Data dahil) bu sembroller için Cumartesi/
+    Pazar günlerine de (gerçek piyasa hareketi olmasa bile) farklı, SENTETİK günlük
+    mumlar döndürebilir. Bu durum "haftalık = 5 gün" gibi beklenen periyot
+    uzunluklarını bozar (7 gün olarak görünür) ve dengeyi yanlış hesaplatır.
+ 
+    Bu yüzden KRİPTO DIŞINDAKİ semboller için Cumartesi/Pazar mumları, değerlerine
+    bakılmaksızın tamamen hesap dışı bırakılır. Kripto (7 gün/hafta gerçekten
+    işlem gören) semboller bundan etkilenmez.
+    """
+    if _is_crypto_symbol(user_symbol):
+        return bars
+    return [b for b in bars if _parse_bar_date(b).weekday() < 5]
  
  
 def _last_completed_day_bars(bars, today: date):
@@ -182,7 +194,7 @@ def _last_completed_day_bars(bars, today: date):
     return [b for b in completed if _parse_bar_date(b) == latest]
  
  
-def _levels_from_bars(bars) -> dict:
+def _levels_from_bars(bars, birim: str = "gün") -> dict:
     if not bars:
         raise ValueError("bu dönem henüz tamamlanmamış veya veri yok")
  
@@ -191,7 +203,7 @@ def _levels_from_bars(bars) -> dict:
         values.append(round(float(bar["high"]), 4))
         values.append(round(float(bar["low"]), 4))
  
-    denge = sum(values) / len(values)
+    denge = statistics.median(values)
     range_ = max(values) - min(values)
     half_range = range_ * 0.5
  
@@ -207,53 +219,87 @@ def _levels_from_bars(bars) -> dict:
         "destek2": denge - range_,
         "range": range_,
         "mod": mods,
-        "gun_sayisi": len(bars),
+        "adet": len(bars),
+        "birim": birim,
         "baslangic": dates[0].isoformat(),
         "bitis": dates[-1].isoformat(),
     }
  
  
+def _compute_short_daily_outputsize(today: date) -> int:
+    """Günlük/Haftalık/Aylık için gereken en geniş geçmişi (Aylık'ın önceki ay
+    sınırı) dinamik olarak hesaplar, küçük bir güvenlik payı ekler."""
+    month_start, _ = get_last_completed_month_range(today)
+    days_needed = (today - month_start).days + 7
+    return max(15, min(days_needed, MAX_SHORT_DAILY_BARS))
+ 
+ 
+def _compute_long_weekly_outputsize(today: date) -> int:
+    """6 Aylık/Yıllık için gereken en geniş geçmişi (Yıllık'ın önceki yıl
+    sınırı) dinamik olarak hesaplar, haftalık mum sayısına çevirir."""
+    year_start, _ = get_last_completed_year_range(today)
+    days_needed = (today - year_start).days
+    weeks_needed = (days_needed // 7) + 3
+    return max(30, min(weeks_needed, MAX_LONG_WEEKLY_BARS))
+ 
+ 
 def calculate_all_periods(user_symbol: str) -> dict:
     today = datetime.now(TR_TZ).date()
- 
-    try:
-        all_bars = fetch_daily_bars(user_symbol, HISTORY_OUTPUTSIZE)
-        all_bars = _dedupe_weekend_bars(all_bars)
-    except Exception as e:
-        error = {"hata": str(e)}
-        return {name: error for name in PERIOD_NAMES}
- 
     results = {}
  
+    # --- KISA İSTEK: günlük mumlar (Günlük / Haftalık / Aylık için) ---
     try:
-        bars = _last_completed_day_bars(all_bars, today)
-        results["Günlük"] = _levels_from_bars(bars)
+        short_size = _compute_short_daily_outputsize(today)
+        daily_bars = fetch_bars(user_symbol, "1day", short_size)
+        daily_bars = _filter_weekend_bars_if_not_crypto(daily_bars, user_symbol)
     except Exception as e:
-        results["Günlük"] = {"hata": str(e)}
+        error = {"hata": str(e)}
+        results["Günlük"] = error
+        results["Haftalık"] = error
+        results["Aylık"] = error
+        daily_bars = None
  
-    try:
-        start, end = get_last_completed_week_range(today)
-        results["Haftalık"] = _levels_from_bars(_filter_by_range(all_bars, start, end))
-    except Exception as e:
-        results["Haftalık"] = {"hata": str(e)}
+    if daily_bars is not None:
+        try:
+            bars = _last_completed_day_bars(daily_bars, today)
+            results["Günlük"] = _levels_from_bars(bars, birim="gün")
+        except Exception as e:
+            results["Günlük"] = {"hata": str(e)}
  
-    try:
-        start, end = get_last_completed_month_range(today)
-        results["Aylık"] = _levels_from_bars(_filter_by_range(all_bars, start, end))
-    except Exception as e:
-        results["Aylık"] = {"hata": str(e)}
+        try:
+            start, end = get_last_completed_week_range(today)
+            results["Haftalık"] = _levels_from_bars(_filter_by_range(daily_bars, start, end), birim="gün")
+        except Exception as e:
+            results["Haftalık"] = {"hata": str(e)}
  
-    try:
-        start, end = get_last_completed_half_year_range(today)
-        results["6 Aylık"] = _levels_from_bars(_filter_by_range(all_bars, start, end))
-    except Exception as e:
-        results["6 Aylık"] = {"hata": str(e)}
+        try:
+            start, end = get_last_completed_month_range(today)
+            results["Aylık"] = _levels_from_bars(_filter_by_range(daily_bars, start, end), birim="gün")
+        except Exception as e:
+            results["Aylık"] = {"hata": str(e)}
  
+    # --- UZUN İSTEK: haftalık mumlar (6 Aylık / Yıllık için, kredi tasarrufu) ---
     try:
-        start, end = get_last_completed_year_range(today)
-        results["Yıllık"] = _levels_from_bars(_filter_by_range(all_bars, start, end))
+        long_size = _compute_long_weekly_outputsize(today)
+        weekly_bars = fetch_bars(user_symbol, "1week", long_size)
     except Exception as e:
-        results["Yıllık"] = {"hata": str(e)}
+        error = {"hata": str(e)}
+        results["6 Aylık"] = error
+        results["Yıllık"] = error
+        weekly_bars = None
+ 
+    if weekly_bars is not None:
+        try:
+            start, end = get_last_completed_half_year_range(today)
+            results["6 Aylık"] = _levels_from_bars(_filter_by_range(weekly_bars, start, end), birim="hafta")
+        except Exception as e:
+            results["6 Aylık"] = {"hata": str(e)}
+ 
+        try:
+            start, end = get_last_completed_year_range(today)
+            results["Yıllık"] = _levels_from_bars(_filter_by_range(weekly_bars, start, end), birim="hafta")
+        except Exception as e:
+            results["Yıllık"] = {"hata": str(e)}
  
     return results
  
@@ -262,32 +308,63 @@ def calculate_all_periods(user_symbol: str) -> dict:
 # TELEGRAM BOTU
 # ----------------------------------------------------------------------------
  
+PERIOD_ICONS = {
+    "Günlük": "🕐",
+    "Haftalık": "📅",
+    "Aylık": "🗓️",
+    "6 Aylık": "📈",
+    "Yıllık": "🏆",
+}
+ 
+ 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Merhaba! 👋\n\n"
+        "✨ *Denge Aralığı Botu* ✨\n\n"
         "Bana bir enstrüman kodu gönder (örn: *BTCUSD*, *XAUUSD*, *EURUSD*).\n\n"
-        "Sana Günlük, Haftalık, Aylık, 6 Aylık ve Yıllık için, SADECE TAMAMLANMIŞ "
-        "(kapanmış) son periyoda göre Denge, Direnç 1/2 ve Destek 1/2 seviyelerini "
-        "hesaplayayım.",
+        "🕐 Günlük  📅 Haftalık  🗓️ Aylık  📈 6 Aylık  🏆 Yıllık\n"
+        "için Denge, Direnç 1/2 ve Destek 1/2 seviyelerini hesaplayayım.\n\n"
+        "_Yalnızca TAMAMLANMIŞ (kapanmış) son periyot kullanılır._\n"
+        "_6 Aylık ve Yıllık, API kredi limiti nedeniyle haftalık mumlarla hesaplanır._",
         parse_mode="Markdown",
     )
  
  
-def format_period_block(period_name: str, result: dict) -> str:
-    if "hata" in result:
-        return f"*{period_name}*\n⚠️ {result['hata']}\n"
+def _format_tr_date(iso_date: str) -> str:
+    """'2026-07-13' -> '13.07.2026'"""
+    d = datetime.strptime(iso_date, "%Y-%m-%d").date()
+    return d.strftime("%d.%m.%Y")
  
-    tarih_araligi = f"{result['baslangic']} → {result['bitis']}"
-    lines = [f"*{period_name}* ({result['gun_sayisi']} gün, {tarih_araligi})"]
-    lines.append(f"  Direnç 2: `{result['direnc2']:,.2f}`")
-    lines.append(f"  Direnç 1: `{result['direnc1']:,.2f}`")
-    lines.append(f"  Denge:    `{result['denge']:,.2f}`")
-    lines.append(f"  Destek 1: `{result['destek1']:,.2f}`")
-    lines.append(f"  Destek 2: `{result['destek2']:,.2f}`")
+ 
+def format_period_block(period_name: str, result: dict) -> str:
+    icon = PERIOD_ICONS.get(period_name, "•")
+ 
+    if "hata" in result:
+        return f"{icon} *{period_name}*\n⚠️ _{result['hata']}_"
+ 
+    birim_etiketi = f"{result['adet']} {result['birim']}"
+    tarih_araligi = f"{_format_tr_date(result['baslangic'])} → {_format_tr_date(result['bitis'])}"
+ 
+    def row(label: str, value: float) -> str:
+        return f"{label:<9}{value:>13,.2f}"
+ 
+    table = "\n".join([
+        row("Direnç 2", result["direnc2"]),
+        row("Direnç 1", result["direnc1"]),
+        "─" * 22,
+        row("⚖ Denge", result["denge"]),
+        "─" * 22,
+        row("Destek 1", result["destek1"]),
+        row("Destek 2", result["destek2"]),
+    ])
+ 
+    lines = [
+        f"{icon} *{period_name}*  _({birim_etiketi} · {tarih_araligi})_",
+        f"```\n{table}\n```",
+    ]
  
     if result["mod"]:
         mod_str = ", ".join(f"{v:,.2f}" for v in result["mod"])
-        lines.append(f"  🔁 Mod (tekrarlayan seviye): `{mod_str}`")
+        lines.append(f"🔁 _Mod (tekrarlayan seviye): {mod_str}_")
  
     return "\n".join(lines)
  
@@ -298,10 +375,12 @@ async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
  
     results = calculate_all_periods(user_symbol)
  
-    blocks = [f"📊 *{user_symbol.upper()} — Denge / Direnç / Destek*", ""]
-    for period_name in PERIOD_NAMES:
+    separator = "━" * 24
+    blocks = [f"💰 *{user_symbol.upper()}*", separator, ""]
+    for i, period_name in enumerate(PERIOD_NAMES):
         blocks.append(format_period_block(period_name, results.get(period_name, {"hata": "sonuç yok"})))
-        blocks.append("")
+        if i < len(PERIOD_NAMES) - 1:
+            blocks.append("")
  
     message = "\n".join(blocks).strip()
  
@@ -309,6 +388,7 @@ async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await processing_msg.edit_text(message, parse_mode="Markdown")
     else:
         await processing_msg.delete()
+        await update.message.reply_text(f"💰 *{user_symbol.upper()}*\n{separator}", parse_mode="Markdown")
         for period_name in PERIOD_NAMES:
             block = format_period_block(period_name, results.get(period_name, {"hata": "sonuç yok"}))
             await update.message.reply_text(block, parse_mode="Markdown")
@@ -328,4 +408,3 @@ def main():
  
 if __name__ == "__main__":
     main()
- 
