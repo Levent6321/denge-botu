@@ -32,7 +32,6 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
  
 import requests
-import yfinance as yf
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -86,17 +85,6 @@ def normalize_symbol(user_symbol: str) -> str:
  
  
 def fetch_bars(user_symbol: str, interval: str, outputsize: int):
-    """
-    Sembole göre doğru kaynağa yönlendirir:
-    - VIX / DXY -> Yahoo Finance (Twelve Data ücretsiz planda bu ikisini vermiyor)
-    - Diğer her şey (forex/kripto/emtia) -> Twelve Data
-    """
-    if _is_yahoo_symbol(user_symbol):
-        return _fetch_bars_yahoo(user_symbol, interval, outputsize)
-    return _fetch_bars_twelvedata(user_symbol, interval, outputsize)
- 
- 
-def _fetch_bars_twelvedata(user_symbol: str, interval: str, outputsize: int):
     """Twelve Data'dan belirtilen aralıkta (1day / 1week) son `outputsize` mumu çeker."""
     if not TWELVE_DATA_API_KEY:
         raise ValueError("TWELVE_DATA_API_KEY tanımlı değil. Ortam değişkenlerini kontrol edin.")
@@ -119,51 +107,6 @@ def _fetch_bars_twelvedata(user_symbol: str, interval: str, outputsize: int):
         raise ValueError(f"'{symbol}' için veri bulunamadı. Sembolü kontrol edin (örn: BTCUSD, XAUUSD, EURUSD).")
  
     return data["values"]
- 
- 
-# Twelve Data'nın ücretsiz planında bulunmayan endeksler için Yahoo Finance eşlemesi.
-YAHOO_ALIASES = {
-    "VIX": "^VIX",
-    "DXY": "DX-Y.NYB",
-}
- 
- 
-def _is_yahoo_symbol(user_symbol: str) -> bool:
-    return user_symbol.strip().upper() in YAHOO_ALIASES
- 
- 
-def _fetch_bars_yahoo(user_symbol: str, interval: str, outputsize: int):
-    """
-    Twelve Data'da ücretsiz planda bulunmayan VIX/DXY gibi endeksler için
-    Yahoo Finance'ten (API anahtarı gerektirmez) veri çeker. Twelve Data ile
-    AYNI bar formatını (datetime/high/low) döndürür ki geri kalan hesaplama
-    kodu hiç değişmeden çalışsın.
-    """
-    yahoo_symbol = YAHOO_ALIASES[user_symbol.strip().upper()]
-    yf_interval = "1wk" if interval == "1week" else "1d"
-    period = "5y" if yf_interval == "1wk" else "1y"
- 
-    try:
-        ticker = yf.Ticker(yahoo_symbol)
-        hist = ticker.history(period=period, interval=yf_interval)
-    except Exception as e:
-        raise ValueError(f"Yahoo Finance'ten '{user_symbol}' verisi alınırken hata oluştu: {e}")
- 
-    if hist is None or hist.empty:
-        raise ValueError(
-            f"'{user_symbol}' için Yahoo Finance'ten veri alınamadı "
-            f"(geçici bir kısıtlama olabilir, birkaç dakika sonra tekrar deneyin)."
-        )
- 
-    hist = hist.tail(outputsize)
-    bars = []
-    for idx, row in hist.iterrows():
-        bars.append({
-            "datetime": idx.strftime("%Y-%m-%d"),
-            "high": float(row["High"]),
-            "low": float(row["Low"]),
-        })
-    return bars
  
  
 # ----------------------------------------------------------------------------
@@ -283,6 +226,7 @@ def _levels_from_bars(bars, birim: str = "gün") -> dict:
         values.append(round(float(bar["low"]), 4))
  
     denge = statistics.median(values)
+    ortalama = statistics.mean(values)
     range_ = max(values) - min(values)
     half_range = range_ * 0.5
  
@@ -301,6 +245,7 @@ def _levels_from_bars(bars, birim: str = "gün") -> dict:
  
     return {
         "denge": denge,
+        "ortalama": ortalama,
         "direnc1": denge + half_range,
         "direnc2": denge + range_,
         "destek1": destek1,
@@ -410,10 +355,10 @@ PERIOD_ICONS = {
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✨ *Denge Aralığı Botu* ✨\n\n"
-        "Bana bir enstrüman kodu gönder (örn: *BTCUSD*, *XAUUSD*, *EURUSD*, "
-        "*VIX*, *DXY*).\n\n"
+        "Bana bir enstrüman kodu gönder (örn: *BTCUSD*, *XAUUSD*, *EURUSD*).\n\n"
         "🕐 Günlük  📅 Haftalık  🗓️ Aylık  📈 6 Aylık  🏆 Yıllık\n"
-        "için Denge, Direnç 1/2 ve Destek 1/2 seviyelerini hesaplayayım.\n\n"
+        "için Denge (Medyan), Aritmetik Ortalama, Direnç 1/2 ve Destek 1/2 "
+        "seviyelerini hesaplayayım.\n\n"
         "_Yalnızca TAMAMLANMIŞ (kapanmış) son periyot kullanılır._\n"
         "_6 Aylık ve Yıllık, API kredi limiti nedeniyle haftalık mumlarla hesaplanır._",
         parse_mode="Markdown",
@@ -444,6 +389,7 @@ def format_period_block(period_name: str, result: dict) -> str:
         row("Direnç 1", result["direnc1"], "🔴"),
         "─" * 22,
         row("Denge", result["denge"], "🟣"),
+        row("Ortalama", result["ortalama"], "🟢"),
         "─" * 22,
         row("Destek 1", result["destek1"], "🔵"),
         row("Destek 2", result["destek2"], "🔵"),
@@ -503,4 +449,3 @@ def main():
  
 if __name__ == "__main__":
     main()
- 
