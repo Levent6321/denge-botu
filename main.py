@@ -49,16 +49,18 @@ TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
 
 # Twelve Data ücretsiz plan: dakikada 8 KREDİ (yaklaşık her 21 mum = 1 kredi).
 # Bu yüzden TEK seferde 800 mum çekmek (~39 kredi) limiti aşıyordu.
-# Çözüm: iki KÜÇÜK istek yapıyoruz:
-#   1) Günlük mumlarla KISA bir istek (Günlük/Haftalık/Aylık için yeterli)
-#   2) Haftalık mumlarla (daha az veri noktası) UZUN bir istek (6 Aylık/Yıllık için)
-# Bu ikisinin toplam kredi maliyeti her zaman ~8 kredinin altında kalacak şekilde
+# Çözüm: ÜÇ KÜÇÜK istek yapıyoruz:
+#   1) 4 saatlik mumlarla ÇOK KISA bir istek (4 Saatlik için, ~1 kredi)
+#   2) Günlük mumlarla KISA bir istek (Günlük/Haftalık/Aylık için yeterli)
+#   3) Haftalık mumlarla (daha az veri noktası) UZUN bir istek (6 Aylık/Yıllık için)
+# Bu üçünün toplam kredi maliyeti her zaman ~8 kredinin altında kalacak şekilde
 # tarihe göre dinamik hesaplanır.
 CREDIT_BAR_UNIT = 21  # ~1 kredi = 21 mum (Twelve Data gözlemlenen davranışı)
 MAX_SHORT_DAILY_BARS = 60   # güvenlik tavanı (~3 kredi)
-MAX_LONG_WEEKLY_BARS = 95   # güvenlik tavanı (~5 kredi)
+MAX_LONG_WEEKLY_BARS = 84   # güvenlik tavanı (~4 kredi)
+FOUR_HOUR_OUTPUTSIZE = 20   # son tamamlanmış 4 saatlik mumu bulmak için (~1 kredi)
 
-PERIOD_NAMES = ["Günlük", "Haftalık", "Aylık", "6 Aylık", "Yıllık"]
+PERIOD_NAMES = ["4 Saatlik", "Günlük", "Haftalık", "Aylık", "6 Aylık", "Yıllık"]
 
 TR_TZ = ZoneInfo("Europe/Istanbul")
 
@@ -173,6 +175,15 @@ def _parse_bar_date(bar: dict) -> date:
     return datetime.strptime(bar["datetime"][:10], "%Y-%m-%d").date()
 
 
+def _parse_bar_datetime(bar: dict) -> datetime:
+    """4 saatlik gibi gün-içi (intraday) mumlarda saat bilgisi de önemli
+    olduğu için tam tarih+saat döner (sadece tarih değil)."""
+    raw = bar["datetime"]
+    if len(raw) > 10:
+        return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+    return datetime.strptime(raw, "%Y-%m-%d")
+
+
 def _filter_by_range(bars, start: date, end: date):
     return [b for b in bars if start <= _parse_bar_date(b) <= end]
 
@@ -281,6 +292,17 @@ def calculate_all_periods(user_symbol: str) -> dict:
     today = datetime.now(TR_TZ).date()
     results = {}
 
+    # --- ÇOK KISA İSTEK: 4 saatlik mumlar (4 Saatlik için) ---
+    try:
+        four_hour_bars = fetch_bars(user_symbol, "4h", FOUR_HOUR_OUTPUTSIZE)
+        four_hour_bars = _filter_weekend_bars_if_not_crypto(four_hour_bars, user_symbol)
+        last_bar = max(four_hour_bars, key=_parse_bar_datetime) if four_hour_bars else None
+        if last_bar is None:
+            raise ValueError("Yeterli 4 saatlik veri bulunamadı.")
+        results["4 Saatlik"] = _levels_from_bars([last_bar], birim="adet 4 saatlik mum")
+    except Exception as e:
+        results["4 Saatlik"] = {"hata": str(e)}
+
     # --- KISA İSTEK: günlük mumlar (Günlük / Haftalık / Aylık için) ---
     try:
         short_size = _compute_short_daily_outputsize(today)
@@ -344,6 +366,7 @@ def calculate_all_periods(user_symbol: str) -> dict:
 # ----------------------------------------------------------------------------
 
 PERIOD_ICONS = {
+    "4 Saatlik": "🕓",
     "Günlük": "🕐",
     "Haftalık": "📅",
     "Aylık": "🗓️",
@@ -356,6 +379,7 @@ PERIOD_ICONS = {
 #  4-2 saatlik işlemler -> 2x30 dk, Aylık -> 2x günlük kapanış,
 #  6 Aylık -> 2x aylık kapanış, Yıllık -> 2x6 aylık kapanış.)
 CONFIRMATION_NOTES = {
+    "4 Saatlik": "2 adet 30 dakikalık kapanış",
     "Günlük": "2 adet 1 saatlik kapanış",
     "Haftalık": "2 adet 4 saatlik kapanış",
     "Aylık": "2 adet günlük kapanış",
