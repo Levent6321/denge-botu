@@ -1,27 +1,9 @@
 """
-DENGE ARALIĞI TELEGRAM BOTU (Tek Dosya)
-========================================
-BTCUSD, XAUUSD, EURUSD gibi enstrümanlar için Günlük / Haftalık / Aylık /
-6 Aylık / Yıllık Denge, Direnç 1-2 ve Destek 1-2 seviyelerini hesaplar.
-
-YÖNTEM:
-  1) Dönemdeki HER GÜNÜN (ya da 6 Aylık/Yıllık için her HAFTANIN) high ve low
-     değeri tek tek alınır (N adet -> 2N sayı).
-  2) Denge = bu 2N sayının MEDYANI (aritmetik ortalama değil — uç değerlerden
-     daha az etkilenmesi için tercih edildi).
-  3) Range = en yüksek değer - en düşük değer.
-  4) Direnç 1 = Denge + Range*0.5    Direnç 2 = Denge + Range
-     Destek 1  = Denge - Range*0.5    Destek 2  = Denge - Range
-  5) Mod: 2N sayı içinde 2+ kez tekrar eden değer varsa işaretlenir.
-
-ÖNEMLİ KURAL: Her dönem SADECE TAMAMLANMIŞ (kapanmış) son periyodu kullanır.
-  Örn. bugün Çarşamba ise "Haftalık" geçen haftanın (Pzt-Paz) verisini kullanır;
-  içinde bulunduğumuz haftanın henüz kapanmamış verisi KULLANILMAZ.
-  Aynı kural Günlük/Aylık/6 Aylık/Yıllık için de geçerlidir.
-
-ÇALIŞTIRMAK İÇİN GEREKLİ ORTAM DEĞİŞKENLERİ:
-  TELEGRAM_BOT_TOKEN   -> BotFather'dan alınan token
-  TWELVE_DATA_API_KEY  -> twelvedata.com üzerinden alınan ücretsiz API anahtarı
+DENGE ARALIĞI TELEGRAM BOTU (Hibrit Model - Twelve Data + yfinance yedekli)
+============================================================================
+Clab'ın orijinal kodu korundu. Sadece XAGUSD gibi ücretsiz planda kapalı
+semboller için yfinance yedek kaynak olarak eklendi.
+BTCUSD, XAUUSD, EURUSD gibi çalışan semboller hâlâ Twelve Data'dan çekilir.
 """
 
 import os
@@ -32,6 +14,7 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
+import yfinance as yf
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -47,18 +30,10 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
 TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
 
-# Twelve Data ücretsiz plan: dakikada 8 KREDİ (yaklaşık her 21 mum = 1 kredi).
-# Bu yüzden TEK seferde 800 mum çekmek (~39 kredi) limiti aşıyordu.
-# Çözüm: ÜÇ KÜÇÜK istek yapıyoruz:
-#   1) 4 saatlik mumlarla ÇOK KISA bir istek (4 Saatlik için, ~1 kredi)
-#   2) Günlük mumlarla KISA bir istek (Günlük/Haftalık/Aylık için yeterli)
-#   3) Haftalık mumlarla (daha az veri noktası) UZUN bir istek (6 Aylık/Yıllık için)
-# Bu üçünün toplam kredi maliyeti her zaman ~8 kredinin altında kalacak şekilde
-# tarihe göre dinamik hesaplanır.
-CREDIT_BAR_UNIT = 21  # ~1 kredi = 21 mum (Twelve Data gözlemlenen davranışı)
-MAX_SHORT_DAILY_BARS = 60   # güvenlik tavanı (~3 kredi)
-MAX_LONG_WEEKLY_BARS = 84   # güvenlik tavanı (~4 kredi)
-FOUR_HOUR_OUTPUTSIZE = 20   # son tamamlanmış 4 saatlik mumu bulmak için (~1 kredi)
+CREDIT_BAR_UNIT = 21
+MAX_SHORT_DAILY_BARS = 60
+MAX_LONG_WEEKLY_BARS = 84
+FOUR_HOUR_OUTPUTSIZE = 20
 
 PERIOD_NAMES = ["4 Saatlik", "Günlük", "Haftalık", "Aylık", "6 Aylık", "Yıllık"]
 
@@ -72,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 
 # ----------------------------------------------------------------------------
-# VERİ ÇEKME (Twelve Data API)
+# SEMBOL NORMALİZASYON
 # ----------------------------------------------------------------------------
 
 def normalize_symbol(user_symbol: str) -> str:
@@ -86,8 +61,49 @@ def normalize_symbol(user_symbol: str) -> str:
     return s
 
 
-def fetch_bars(user_symbol: str, interval: str, outputsize: int):
-    """Twelve Data'dan belirtilen aralıkta (1day / 1week) son `outputsize` mumu çeker."""
+def _normalize_yfinance_symbol(user_symbol: str) -> str:
+    """Kullanıcı girdisini yfinance formatına çevirir (yedek kaynak için)."""
+    s = user_symbol.strip().upper().replace(" ", "")
+
+    # DXY özel durumu
+    if s in ("DXY", "DXYUSD"):
+        return "DX-Y.NYB"
+
+    # VIX özel durumu
+    if s in ("VIX", "VIXUSD"):
+        return "^VIX"
+
+    # BIST endeksleri özel durumu
+    if s in ("XU100", "BIST100"):
+        return "^XU100"
+    if s in ("XU030", "XU30", "BIST30"):
+        return "^XU030"
+
+    if "/" in s:
+        base, quote = s.split("/")
+    elif len(s) > 3:
+        base, quote = s[:-3], s[-3:]
+    else:
+        return s
+
+    # Emtialar (XAG, XAU, XPT, XPD) -> =X eki
+    if base in ("XAU", "XAG", "XPT", "XPD"):
+        return f"{base}{quote}=X"
+    # Forex majörleri -> =X eki
+    forex_bases = {"EUR", "GBP", "USD", "JPY", "CHF", "AUD", "NZD", "CAD"}
+    forex_quotes = {"USD", "EUR", "GBP", "JPY", "CHF", "AUD", "NZD", "CAD"}
+    if base in forex_bases and quote in forex_quotes:
+        return f"{base}{quote}=X"
+    # Kripto ve hisseler -> - formatı
+    return f"{base}-{quote}"
+
+
+# ----------------------------------------------------------------------------
+# VERİ ÇEKME - ANA KAYNAK: Twelve Data
+# ----------------------------------------------------------------------------
+
+def fetch_bars_twelvedata(user_symbol: str, interval: str, outputsize: int):
+    """Twelve Data'dan belirtilen aralıkta son `outputsize` mumu çeker."""
     if not TWELVE_DATA_API_KEY:
         raise ValueError("TWELVE_DATA_API_KEY tanımlı değil. Ortam değişkenlerini kontrol edin.")
 
@@ -103,7 +119,12 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
     data = resp.json()
 
     if isinstance(data, dict) and data.get("status") == "error":
-        raise ValueError(data.get("message", f"'{symbol}' için veri alınamadı."))
+        msg = data.get("message", "")
+        # "plan" / "Grow" / "Venture" / "available starting" geçiyorsa
+        # -> bu sembol ücretsiz planda kapalı, yedek kaynağa geçilecek
+        if any(word in msg.lower() for word in ["plan", "grow", "venture", "available starting"]):
+            raise ValueError("UPGRADE_REQUIRED")
+        raise ValueError(msg)
 
     if "values" not in data:
         raise ValueError(f"'{symbol}' için veri bulunamadı. Sembolü kontrol edin (örn: BTCUSD, XAUUSD, EURUSD).")
@@ -112,20 +133,140 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
 
 
 # ----------------------------------------------------------------------------
+# VERİ ÇEKME - YEDEK KAYNAK: yfinance (sadece Twelve Data başarısız olursa)
+# ----------------------------------------------------------------------------
+
+def fetch_bars_yfinance(user_symbol: str, interval: str, outputsize: int):
+    """
+    Yedek veri kaynağı. Sadece Twelve Data 'UPGRADE_REQUIRED' hatası
+    verdiğinde (ücretsiz planda kapalı semboller için) çağrılır.
+    """
+    symbol = _normalize_yfinance_symbol(user_symbol)
+
+    if interval == "4h":
+        return _fetch_4h_yfinance(symbol, outputsize)
+    elif interval == "1day":
+        return _fetch_daily_yfinance(symbol, outputsize)
+    elif interval == "1week":
+        return _fetch_weekly_yfinance(symbol, outputsize)
+    else:
+        raise ValueError(f"yfinance desteklenmeyen interval: {interval}")
+
+
+def _fetch_daily_yfinance(symbol: str, outputsize: int):
+    ticker = yf.Ticker(symbol)
+    end = datetime.now(TR_TZ)
+    start = end - timedelta(days=outputsize + 10)
+    df = ticker.history(start=start, end=end, interval="1d")
+
+    if df.empty:
+        raise ValueError(f"yfinance: '{symbol}' için günlük veri bulunamadı")
+
+    return [
+        {"datetime": idx.strftime("%Y-%m-%d"), "high": float(row["High"]), "low": float(row["Low"])}
+        for idx, row in df.tail(outputsize).iterrows()
+    ]
+
+
+def _fetch_weekly_yfinance(symbol: str, outputsize: int):
+    ticker = yf.Ticker(symbol)
+    end = datetime.now(TR_TZ)
+    start = end - timedelta(weeks=outputsize + 5)
+    df = ticker.history(start=start, end=end, interval="1wk")
+
+    if df.empty:
+        raise ValueError(f"yfinance: '{symbol}' için haftalık veri bulunamadı")
+
+    return [
+        {"datetime": idx.strftime("%Y-%m-%d"), "high": float(row["High"]), "low": float(row["Low"])}
+        for idx, row in df.tail(outputsize).iterrows()
+    ]
+
+
+def _fetch_4h_yfinance(symbol: str, outputsize: int):
+    ticker = yf.Ticker(symbol)
+    end = datetime.now(TR_TZ)
+    start = end - timedelta(hours=(outputsize + 1) * 4 + 10)
+    df = ticker.history(start=start, end=end, interval="1h")
+
+    if df.empty:
+        raise ValueError(f"yfinance: '{symbol}' için 4 saatlik veri bulunamadı")
+
+    df_4h = df.resample("4h").agg({
+        "Open": "first", "High": "max", "Low": "min", "Close": "last"
+    }).dropna()
+
+    return [
+        {"datetime": idx.strftime("%Y-%m-%d %H:%M:%S"), "high": float(row["High"]), "low": float(row["Low"])}
+        for idx, row in df_4h.tail(outputsize).iterrows()
+    ]
+
+
+# ----------------------------------------------------------------------------
+# ANA fetch_bars FONKSİYONU (Önce Twelve Data, başarısızsa yfinance)
+# ----------------------------------------------------------------------------
+
+# Twelve Data'nın hiç taşımadığı (BIST endeksleri gibi) semboller.
+# Bunlar için Twelve Data'yı denemeden direkt yfinance'e gidilir.
+YFINANCE_ONLY_SYMBOLS = {"XU100", "BIST100", "XU030", "XU30", "BIST30"}
+
+# 1 ons = 31.1034768 gram. XAUTRYG (Gram Altın/TL) hiçbir sağlayıcıda tek bir
+# sembol olarak bulunmuyor; (XAU/USD / 31.1034768) * USD/TRY formülüyle
+# TÜRETİLİR.
+GRAMS_PER_TROY_OUNCE = 31.1034768
+
+
+def fetch_bars(user_symbol: str, interval: str, outputsize: int):
+    """
+    Önce Twelve Data'yı dener.
+    Eğer 'UPGRADE_REQUIRED' hatası alırsa (ücretsiz planda kapalı sembol),
+    otomatik olarak yfinance yedek kaynağına geçer.
+    XU100/XU030 gibi Twelve Data'da hiç bulunmayan semboller için
+    Twelve Data hiç denenmeden direkt yfinance kullanılır.
+    XAUTRYG (Gram Altın/TL) ise XAU/TRY üzerinden TÜRETİLİR (gerçek bir
+    sembol değil, ons fiyatı 31.1034768'e bölünerek gram fiyatı elde edilir).
+    """
+    normalized_input = user_symbol.strip().upper().replace(" ", "")
+
+    if normalized_input in ("XAUTRYG", "GRAMALTIN"):
+        # Formül: (XAUUSD / 31.1034768) * USDTRY
+        xau_bars = fetch_bars("XAUUSD", interval, outputsize)
+        usdtry_bars = fetch_bars("USDTRY", interval, outputsize)
+        usdtry_by_date = {b["datetime"]: b for b in usdtry_bars}
+
+        result = []
+        for xb in xau_bars:
+            ub = usdtry_by_date.get(xb["datetime"])
+            if ub is None:
+                continue  # o tarihte eşleşen USDTRY verisi yoksa bu günü atla
+            result.append({
+                "datetime": xb["datetime"],
+                "high": (float(xb["high"]) / GRAMS_PER_TROY_OUNCE) * float(ub["high"]),
+                "low": (float(xb["low"]) / GRAMS_PER_TROY_OUNCE) * float(ub["low"]),
+            })
+
+        if not result:
+            raise ValueError("XAUTRYG için XAUUSD ve USDTRY tarihleri eşleştirilemedi.")
+        return result
+
+    if normalized_input in YFINANCE_ONLY_SYMBOLS:
+        return fetch_bars_yfinance(user_symbol, interval, outputsize)
+
+    try:
+        return fetch_bars_twelvedata(user_symbol, interval, outputsize)
+    except ValueError as e:
+        if str(e) == "UPGRADE_REQUIRED":
+            logger.info(f"🔄 '{user_symbol}' Twelve Data ücretsiz planda kapalı, yfinance deneniyor...")
+            return fetch_bars_yfinance(user_symbol, interval, outputsize)
+        raise
+
+
+# ----------------------------------------------------------------------------
 # DÖNEM SINIRLARI (son TAMAMLANMIŞ hafta / ay / yarıyıl / yıl)
 # ----------------------------------------------------------------------------
 
 def get_last_completed_week_range(today: date, is_crypto: bool = False):
-    """
-    Kripto (7 gün/hafta işlem görür): Hafta Pazartesi-Pazar kabul edilir.
-    İçinde bulunduğumuz hafta HENÜZ KAPANMAMIŞ sayılır.
-
-    Forex/emtia (Pazartesi-Cuma işlem görür): Hafta Pazartesi-Cuma kabul edilir.
-    Cuma kapanışından sonra (yani bugün Cumartesi veya Pazar ise) o haftanın
-    ARTIK TAMAMLANDIĞI kabul edilir ve o hafta gösterilir (bir hafta geriye
-    gitmeye gerek yoktur, çünkü Cuma akşamı piyasa zaten kapanmıştır).
-    """
-    weekday = today.weekday()  # 0=Pzt ... 4=Cuma, 5=Cmt, 6=Paz
+    weekday = today.weekday()
 
     if is_crypto:
         this_monday = today - timedelta(days=weekday)
@@ -134,10 +275,8 @@ def get_last_completed_week_range(today: date, is_crypto: bool = False):
         return last_monday, last_sunday
 
     if weekday >= 5:
-        # Bugün Cumartesi/Pazar -> bu haftanın Pzt-Cuma'sı zaten tamamlandı
         week_monday = today - timedelta(days=weekday)
     else:
-        # Bugün Pzt-Cuma arası -> bu hafta henüz bitmedi, önceki haftayı kullan
         this_monday = today - timedelta(days=weekday)
         week_monday = this_monday - timedelta(days=7)
 
@@ -146,7 +285,6 @@ def get_last_completed_week_range(today: date, is_crypto: bool = False):
 
 
 def get_last_completed_month_range(today: date):
-    """İçinde bulunduğumuz ay kapanmamış sayılır; bir önceki takvim ayı döner."""
     first_of_this_month = today.replace(day=1)
     last_day_prev_month = first_of_this_month - timedelta(days=1)
     first_day_prev_month = last_day_prev_month.replace(day=1)
@@ -154,7 +292,6 @@ def get_last_completed_month_range(today: date):
 
 
 def get_last_completed_half_year_range(today: date):
-    """Yarıyıllar Ocak-Haziran / Temmuz-Aralık kabul edilir."""
     year = today.year
     if today.month <= 6:
         return date(year - 1, 7, 1), date(year - 1, 12, 31)
@@ -162,7 +299,6 @@ def get_last_completed_half_year_range(today: date):
 
 
 def get_last_completed_year_range(today: date):
-    """İçinde bulunduğumuz takvim yılı kapanmamış sayılır; bir önceki yıl döner."""
     last_year = today.year - 1
     return date(last_year, 1, 1), date(last_year, 12, 31)
 
@@ -176,8 +312,6 @@ def _parse_bar_date(bar: dict) -> date:
 
 
 def _parse_bar_datetime(bar: dict) -> datetime:
-    """4 saatlik gibi gün-içi (intraday) mumlarda saat bilgisi de önemli
-    olduğu için tam tarih+saat döner (sadece tarih değil)."""
     raw = bar["datetime"]
     if len(raw) > 10:
         return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
@@ -202,24 +336,12 @@ def _is_crypto_symbol(user_symbol: str) -> bool:
 
 
 def _filter_weekend_bars_if_not_crypto(bars, user_symbol: str):
-    """
-    XAUUSD, EURUSD gibi forex/emtia sembolleri normalde Pazartesi-Cuma işlem görür.
-    Ancak bazı veri sağlayıcıları (Twelve Data dahil) bu sembroller için Cumartesi/
-    Pazar günlerine de (gerçek piyasa hareketi olmasa bile) farklı, SENTETİK günlük
-    mumlar döndürebilir. Bu durum "haftalık = 5 gün" gibi beklenen periyot
-    uzunluklarını bozar (7 gün olarak görünür) ve dengeyi yanlış hesaplatır.
-
-    Bu yüzden KRİPTO DIŞINDAKİ semboller için Cumartesi/Pazar mumları, değerlerine
-    bakılmaksızın tamamen hesap dışı bırakılır. Kripto (7 gün/hafta gerçekten
-    işlem gören) semboller bundan etkilenmez.
-    """
     if _is_crypto_symbol(user_symbol):
         return bars
     return [b for b in bars if _parse_bar_date(b).weekday() < 5]
 
 
 def _last_completed_day_bars(bars, today: date):
-    """Bugün HARİÇ, en güncel tamamlanmış tek günün mumunu döner."""
     completed = [b for b in bars if _parse_bar_date(b) < today]
     if not completed:
         return []
@@ -272,16 +394,12 @@ def _levels_from_bars(bars, birim: str = "gün") -> dict:
 
 
 def _compute_short_daily_outputsize(today: date) -> int:
-    """Günlük/Haftalık/Aylık için gereken en geniş geçmişi (Aylık'ın önceki ay
-    sınırı) dinamik olarak hesaplar, küçük bir güvenlik payı ekler."""
     month_start, _ = get_last_completed_month_range(today)
     days_needed = (today - month_start).days + 7
     return max(15, min(days_needed, MAX_SHORT_DAILY_BARS))
 
 
 def _compute_long_weekly_outputsize(today: date) -> int:
-    """6 Aylık/Yıllık için gereken en geniş geçmişi (Yıllık'ın önceki yıl
-    sınırı) dinamik olarak hesaplar, haftalık mum sayısına çevirir."""
     year_start, _ = get_last_completed_year_range(today)
     days_needed = (today - year_start).days
     weeks_needed = (days_needed // 7) + 3
@@ -292,7 +410,7 @@ def calculate_all_periods(user_symbol: str) -> dict:
     today = datetime.now(TR_TZ).date()
     results = {}
 
-    # --- ÇOK KISA İSTEK: 4 saatlik mumlar (4 Saatlik için) ---
+    # --- 4 Saatlik ---
     try:
         four_hour_bars = fetch_bars(user_symbol, "4h", FOUR_HOUR_OUTPUTSIZE)
         four_hour_bars = _filter_weekend_bars_if_not_crypto(four_hour_bars, user_symbol)
@@ -303,7 +421,7 @@ def calculate_all_periods(user_symbol: str) -> dict:
     except Exception as e:
         results["4 Saatlik"] = {"hata": str(e)}
 
-    # --- KISA İSTEK: günlük mumlar (Günlük / Haftalık / Aylık için) ---
+    # --- Günlük, Haftalık, Aylık (günlük mumlar) ---
     try:
         short_size = _compute_short_daily_outputsize(today)
         daily_bars = fetch_bars(user_symbol, "1day", short_size)
@@ -335,7 +453,7 @@ def calculate_all_periods(user_symbol: str) -> dict:
         except Exception as e:
             results["Aylık"] = {"hata": str(e)}
 
-    # --- UZUN İSTEK: haftalık mumlar (6 Aylık / Yıllık için, kredi tasarrufu) ---
+    # --- 6 Aylık, Yıllık (haftalık mumlar) ---
     try:
         long_size = _compute_long_weekly_outputsize(today)
         weekly_bars = fetch_bars(user_symbol, "1week", long_size)
@@ -374,10 +492,6 @@ PERIOD_ICONS = {
     "Yıllık": "🏆",
 }
 
-# Denge/Direnç/Destek seviyelerini "onaylamak" için baz alınacak kapanış türü.
-# (Kullanıcı tanımı: Haftalık -> 2x4 saatlik, Günlük -> 2x1 saatlik,
-#  4-2 saatlik işlemler -> 2x30 dk, Aylık -> 2x günlük kapanış,
-#  6 Aylık -> 2x aylık kapanış, Yıllık -> 2x6 aylık kapanış.)
 CONFIRMATION_NOTES = {
     "4 Saatlik": "2 adet 30 dakikalık kapanış",
     "Günlük": "2 adet 1 saatlik kapanış",
@@ -391,7 +505,8 @@ CONFIRMATION_NOTES = {
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✨ *Denge Aralığı Botu* ✨\n\n"
-        "Bana bir enstrüman kodu gönder (örn: *BTCUSD*, *XAUUSD*, *EURUSD*).\n\n"
+        "Bana bir enstrüman kodu gönder (örn: *BTCUSD*, *XAUUSD*, *XAGUSD*, *XPTUSD*, "
+        "*XPDUSD*, *EURUSD*, *DXY*, *VIX*, *XU100*, *XU030*, *XAUTRYG*).\n\n"
         "🕐 Günlük  📅 Haftalık  🗓️ Aylık  📈 6 Aylık  🏆 Yıllık\n"
         "için Denge (Medyan), Aritmetik Ortalama, Direnç 1/2 ve Destek 1/2 "
         "seviyelerini hesaplayayım.\n\n"
@@ -402,7 +517,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _format_tr_date(iso_date: str) -> str:
-    """'2026-07-13' -> '13.07.2026'"""
     d = datetime.strptime(iso_date, "%Y-%m-%d").date()
     return d.strftime("%d.%m.%Y")
 
