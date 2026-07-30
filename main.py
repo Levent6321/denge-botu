@@ -17,7 +17,6 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
-import yfinance as yf
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -615,43 +614,7 @@ def format_period_block(period_name: str, result: dict) -> str:
 
 
 async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_symbol = update.message.text.strip().upper()
-    
-    # ===== YENİ: SADECE BU 5 SEMBOL İÇİN YAHOO FINANCE =====
-    if user_symbol in ["XAGUSD", "XPTUSD", "XPDUSD", "VIX", "DXY"]:
-        processing_msg = await update.message.reply_text(f"⏳ {user_symbol} sorgulanıyor (Yahoo Finance)...")
-        try:
-            import yfinance as yf
-            yahoo_map = {
-                "XAGUSD": "SI=F",
-                "XPTUSD": "PL=F",
-                "XPDUSD": "PA=F",
-                "VIX": "^VIX",
-                "DXY": "DX-Y.NYB"
-            }
-            ticker = yf.Ticker(yahoo_map[user_symbol])
-            df = ticker.history(period="5d")
-            
-            if df.empty:
-                await processing_msg.edit_text(f"❌ {user_symbol} için veri bulunamadı")
-                return
-            
-            # Son 5 günün verilerini göster
-            message = f"💰 *{user_symbol}* (Yahoo Finance)\n"
-            message += "━━━━━━━━━━━━━━━━━━━\n"
-            for idx, row in df.tail(5).iterrows():
-                date_str = idx.strftime("%d.%m")
-                message += f"📅 {date_str}: Açılış {row['Open']:.2f}, Kapanış {row['Close']:.2f}\n"
-            
-            await processing_msg.edit_text(message, parse_mode="Markdown")
-            return
-            
-        except Exception as e:
-            await processing_msg.edit_text(f"❌ Yahoo Finance hatası: {str(e)}")
-            return
-    # ===== YENİ KOD BİTTI =====
-    
-    # ===== MEVCUT KODUN AYNEN DEVAMI =====
+    user_symbol = update.message.text.strip()
     processing_msg = await update.message.reply_text(f"⏳ {user_symbol.upper()} hesaplanıyor...")
 
     results = calculate_all_periods(user_symbol)
