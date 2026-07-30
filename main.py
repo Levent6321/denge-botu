@@ -3,7 +3,9 @@ DENGE ARALIĞI TELEGRAM BOTU (3 Kaynaklı Hibrit Model)
 ============================================================================
 1) Twelve Data      -> BTCUSD, XAUUSD, EURUSD gibi standart forex/kripto/emtia
 2) isyatirimhisse    -> XU100, XU030, XU500 gibi BIST endeksleri (İş Yatırım)
-3) Yahoo Finance     -> XAGUSD, XPTUSD, XPDUSD, VIX, DXY (SADECE BU SEMBOLLER İÇİN)
+3) Stooq (yedek)     -> Twelve Data'da ücretsiz planda kapalı olan XAGUSD,
+                        XPTUSD, XPDUSD, VIX, DXY gibi semboller için denenir
+                        (garantisi yoktur, Twelve Data reddederse devreye girer)
 XAUTRYG (Gram Altın/TL) ise XAUUSD ve USDTRY üzerinden TÜRETİLİR.
 """
 
@@ -252,7 +254,7 @@ def fetch_bars_stooq(user_symbol: str, interval: str, outputsize: int):
 
 
 # ----------------------------------------------------------------------------
-# ANA fetch_bars FONKSİYONU (SADECE BURASI DEĞİŞTİ)
+# ANA fetch_bars FONKSİYONU
 # ----------------------------------------------------------------------------
 
 # 1 ons = 31.1034768 gram. XAUTRYG (Gram Altın/TL) hiçbir sağlayıcıda tek bir
@@ -266,13 +268,11 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
     Sıralama:
       1) XAUTRYG -> XAUUSD ve USDTRY üzerinden TÜRETİLİR.
       2) XU100/XU030/XU500 -> doğrudan isyatirimhisse (İş Yatırım).
-      3) XAGUSD, XPTUSD, XPDUSD, VIX, DXY -> YAHOO FINANCE (SADECE BUNLAR)
-      4) Diğer her şey -> önce Twelve Data; 'UPGRADE_REQUIRED' hatası
-         alırsa Stooq denenir.
+      3) Diğer her şey -> önce Twelve Data; 'UPGRADE_REQUIRED' hatası
+         alırsa (ücretsiz planda kapalı sembol) Stooq denenir (garantisiz).
     """
     normalized_input = user_symbol.strip().upper().replace(" ", "")
 
-    # 1) XAUTRYG (Gram Altın) türetme
     if normalized_input in ("XAUTRYG", "GRAMALTIN"):
         # Formül: (XAUUSD / 31.1034768) * USDTRY
         xau_bars = fetch_bars("XAUUSD", interval, outputsize)
@@ -294,63 +294,9 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
             raise ValueError("XAUTRYG için XAUUSD ve USDTRY tarihleri eşleştirilemedi.")
         return result
 
-    # 2) BIST endeksleri
     if normalized_input in BIST_INDEX_ALIASES:
         return fetch_bars_bist_index(user_symbol, interval, outputsize)
 
-    # 3) YENİ: XAGUSD, XPTUSD, XPDUSD, VIX, DXY için YAHOO FINANCE
-    if normalized_input in ["XAGUSD", "XPTUSD", "XPDUSD", "VIX", "DXY"]:
-        try:
-            yahoo_map = {
-                "XAGUSD": "SI=F",
-                "XPTUSD": "PL=F",
-                "XPDUSD": "PA=F",
-                "VIX": "^VIX",
-                "DXY": "DX-Y.NYB"
-            }
-            
-            yf_symbol = yahoo_map[normalized_input]
-            
-            interval_map = {
-                "4h": "60m",
-                "1day": "1d",
-                "1week": "1wk",
-            }
-            yf_interval = interval_map.get(interval, "1d")
-            
-            if interval == "4h":
-                period = "5d"
-            else:
-                period = f"{outputsize * 2}d" if interval == "1day" else f"{outputsize * 2}wk"
-            
-            ticker = yf.Ticker(yf_symbol)
-            df = ticker.history(period=period, interval=yf_interval)
-            
-            if df.empty:
-                raise ValueError("Yahoo Finance: Veri yok")
-            
-            bars = []
-            for idx, row in df.iterrows():
-                bars.append({
-                    "datetime": idx.strftime("%Y-%m-%d %H:%M:%S"),
-                    "high": float(row['High']),
-                    "low": float(row['Low']),
-                })
-            
-            result = bars[-outputsize:] if len(bars) > outputsize else bars
-            
-            if result:
-                logger.info(f"✅ Yahoo Finance: {user_symbol} için {len(result)} veri alındı")
-                return result
-            else:
-                raise ValueError("Veri boş geldi")
-                
-        except Exception as e:
-            logger.warning(f"Yahoo Finance başarısız: {e}, Stooq deneniyor...")
-            # Yahoo başarısız olursa Stooq dene
-            return fetch_bars_stooq(user_symbol, interval, outputsize)
-
-    # 4) Twelve Data + Stooq yedek
     try:
         return fetch_bars_twelvedata(user_symbol, interval, outputsize)
     except ValueError as e:
@@ -669,7 +615,43 @@ def format_period_block(period_name: str, result: dict) -> str:
 
 
 async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_symbol = update.message.text.strip()
+    user_symbol = update.message.text.strip().upper()
+    
+    # ===== YENİ: SADECE BU 5 SEMBOL İÇİN YAHOO FINANCE =====
+    if user_symbol in ["XAGUSD", "XPTUSD", "XPDUSD", "VIX", "DXY"]:
+        processing_msg = await update.message.reply_text(f"⏳ {user_symbol} sorgulanıyor (Yahoo Finance)...")
+        try:
+            import yfinance as yf
+            yahoo_map = {
+                "XAGUSD": "SI=F",
+                "XPTUSD": "PL=F",
+                "XPDUSD": "PA=F",
+                "VIX": "^VIX",
+                "DXY": "DX-Y.NYB"
+            }
+            ticker = yf.Ticker(yahoo_map[user_symbol])
+            df = ticker.history(period="5d")
+            
+            if df.empty:
+                await processing_msg.edit_text(f"❌ {user_symbol} için veri bulunamadı")
+                return
+            
+            # Son 5 günün verilerini göster
+            message = f"💰 *{user_symbol}* (Yahoo Finance)\n"
+            message += "━━━━━━━━━━━━━━━━━━━\n"
+            for idx, row in df.tail(5).iterrows():
+                date_str = idx.strftime("%d.%m")
+                message += f"📅 {date_str}: Açılış {row['Open']:.2f}, Kapanış {row['Close']:.2f}\n"
+            
+            await processing_msg.edit_text(message, parse_mode="Markdown")
+            return
+            
+        except Exception as e:
+            await processing_msg.edit_text(f"❌ Yahoo Finance hatası: {str(e)}")
+            return
+    # ===== YENİ KOD BİTTI =====
+    
+    # ===== MEVCUT KODUN AYNEN DEVAMI =====
     processing_msg = await update.message.reply_text(f"⏳ {user_symbol.upper()} hesaplanıyor...")
 
     results = calculate_all_periods(user_symbol)
