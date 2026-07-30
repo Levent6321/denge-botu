@@ -1,11 +1,11 @@
 """
-DENGE ARALIĞI TELEGRAM BOTU (3 Kaynaklı Hibrit Model)
+DENGE ARALIĞI TELEGRAM BOTU (3 Kaynaklı Hibrit Model) - GELİŞTİRİLMİŞ
 ============================================================================
 1) Twelve Data      -> BTCUSD, XAUUSD, EURUSD gibi standart forex/kripto/emtia
 2) isyatirimhisse    -> XU100, XU030, XU500 gibi BIST endeksleri (İş Yatırım)
 3) Stooq (yedek)     -> Twelve Data'da ücretsiz planda kapalı olan XAGUSD,
                         XPTUSD, XPDUSD, VIX, DXY gibi semboller için denenir
-                        (garantisi yoktur, Twelve Data reddederse devreye girer)
+                        (GELİŞTİRİLMİŞ: Çoklu URL denemesi, debug loglama)
 XAUTRYG (Gram Altın/TL) ise XAUUSD ve USDTRY üzerinden TÜRETİLİR.
 """
 
@@ -72,15 +72,19 @@ def _normalize_stooq_symbol(user_symbol: str) -> str:
     """Kullanıcı girdisini Stooq formatına çevirir (yedek kaynak için)."""
     s = user_symbol.strip().upper().replace(" ", "")
 
-    # VIX özel durumu (endeksler Stooq'ta '^' öneki alır)
+    # Özel durumlar
     if s in ("VIX", "VIXUSD"):
         return "^vix"
-
-    # DXY: Stooq'ta net teyit edilemedi, en olası tahmin denenir
     if s in ("DXY", "DXYUSD"):
         return "usdx"
-
-    # Forex/emtia genel formatı: küçük harf, ayraçsız (xauusd, xagusd, xptusd, xpdusd vb.)
+    if s in ("XAGUSD", "XAG/USD"):
+        return "xagusd"
+    if s in ("XPTUSD", "XPT/USD"):
+        return "xptusd"
+    if s in ("XPDUSD", "XPD/USD"):
+        return "xpdusd"
+    
+    # Forex/emtia genel formatı: küçük harf, ayraçsız
     return s.replace("/", "").lower()
 
 
@@ -101,8 +105,13 @@ def fetch_bars_twelvedata(user_symbol: str, interval: str, outputsize: int):
         "apikey": TWELVE_DATA_API_KEY,
     }
 
-    resp = requests.get(TWELVE_DATA_URL, params=params, timeout=15)
-    data = resp.json()
+    logger.info(f"📊 Twelve Data çağrısı: {symbol} {interval} {outputsize}")
+    
+    try:
+        resp = requests.get(TWELVE_DATA_URL, params=params, timeout=15)
+        data = resp.json()
+    except Exception as e:
+        raise ValueError(f"Twelve Data bağlantı hatası: {e}")
 
     if isinstance(data, dict) and data.get("status") == "error":
         msg = data.get("message", "")
@@ -115,6 +124,7 @@ def fetch_bars_twelvedata(user_symbol: str, interval: str, outputsize: int):
     if "values" not in data:
         raise ValueError(f"'{symbol}' için veri bulunamadı. Sembolü kontrol edin (örn: BTCUSD, XAUUSD, EURUSD).")
 
+    logger.info(f"✅ Twelve Data'dan {len(data['values'])} veri alındı")
     return data["values"]
 
 
@@ -156,18 +166,23 @@ def fetch_bars_bist_index(user_symbol: str, interval: str, outputsize: int):
         raise ValueError("İş Yatırım kaynağında 4 saatlik veri yok.")
 
     if isyatirimhisse is None:
-        raise ValueError("isyatirimhisse kütüphanesi kurulu değil.")
+        raise ValueError("isyatirimhisse kütüphanesi kurulu değil. pip install isyatirimhisse")
 
     index_code = BIST_INDEX_ALIASES[user_symbol.strip().upper().replace(" ", "")]
 
     today = datetime.now(TR_TZ).date()
     start = today - timedelta(days=800)  # ~2.2 yıl geriye, yıllık ihtiyacı karşılar
 
-    df = isyatirimhisse.fetch_index_data(
-        indices=index_code,
-        start_date=start.strftime("%d-%m-%Y"),
-        end_date=today.strftime("%d-%m-%Y"),
-    )
+    logger.info(f"📊 İş Yatırım çağrısı: {index_code}")
+    
+    try:
+        df = isyatirimhisse.fetch_index_data(
+            indices=index_code,
+            start_date=start.strftime("%d-%m-%Y"),
+            end_date=today.strftime("%d-%m-%Y"),
+        )
+    except Exception as e:
+        raise ValueError(f"İş Yatırım hatası: {e}")
 
     if df is None or df.empty:
         raise ValueError(f"İş Yatırım'dan '{user_symbol}' için veri alınamadı.")
@@ -193,63 +208,130 @@ def fetch_bars_bist_index(user_symbol: str, interval: str, outputsize: int):
             if high_val is None or low_val is None:
                 continue
             bars.append({"datetime": dt_str, "high": high_val, "low": low_val})
-        except Exception:
+        except Exception as e:
             continue
 
     if not bars:
         raise ValueError(f"'{user_symbol}' için ayrıştırılabilir veri bulunamadı.")
 
     bars.sort(key=lambda b: b["datetime"])
+    logger.info(f"✅ İş Yatırım'dan {len(bars)} veri alındı")
     return bars[-outputsize:] if len(bars) > outputsize else bars
 
 
 # ----------------------------------------------------------------------------
-# VERİ ÇEKME - YEDEK KAYNAK: Stooq (sadece Twelve Data başarısız olursa)
+# VERİ ÇEKME - YEDEK KAYNAK: Stooq (GELİŞTİRİLMİŞ)
 # ----------------------------------------------------------------------------
 
 def fetch_bars_stooq(user_symbol: str, interval: str, outputsize: int):
     """
     Yedek veri kaynağı. Sadece Twelve Data 'UPGRADE_REQUIRED' hatası
     verdiğinde (ücretsiz planda kapalı semboller için) çağrılır.
-    Stooq'ta gün-içi (4 saatlik) veri YOKTUR, sadece günlük/haftalık.
-    NOT: Stooq'un resmi API'si yoktur, bu basit CSV linkine dayanır;
-    bazı semboller (özellikle DXY) garantili çalışmayabilir.
+    GELİŞTİRİLMİŞ: Çoklu URL denemesi, daha iyi hata yönetimi.
     """
     if interval == "4h":
         raise ValueError("Stooq kaynağında 4 saatlik veri yok.")
 
     stooq_interval = "w" if interval == "1week" else "d"
     symbol = _normalize_stooq_symbol(user_symbol)
-    url = f"https://stooq.com/q/d/l/?s={symbol}&i={stooq_interval}"
-
-    try:
-        resp = requests.get(url, timeout=15)
-    except Exception as e:
-        raise ValueError(f"Stooq'a bağlanılamadı: {e}")
-
-    text = resp.text.strip()
-    lines_ = text.splitlines()
-    if not lines_ or "Date" not in lines_[0]:
-        raise ValueError(f"Stooq: '{user_symbol}' için veri alınamadı (sembol bulunamadı olabilir).")
-
-    bars = []
-    for line in lines_[1:]:
-        parts = line.split(",")
-        if len(parts) < 5:
-            continue
+    
+    # Farklı URL formatlarını dene
+    url_templates = [
+        f"https://stooq.com/q/d/l/?s={{symbol}}&i={{interval}}",
+        f"https://stooq.com/q/d/l/?s={{symbol}}.US&i={{interval}}",
+        f"https://stooq.com/q/d/l/?s={{symbol}}_USD&i={{interval}}",
+    ]
+    
+    # User-Agent ekle (bazı siteler botları engelliyor)
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+    
+    for url_template in url_templates:
         try:
-            bars.append({
-                "datetime": parts[0],
-                "high": float(parts[2]),
-                "low": float(parts[3]),
-            })
-        except ValueError:
+            url = url_template.format(symbol=symbol, interval=stooq_interval)
+            logger.info(f"🔄 Stooq deneniyor: {url}")
+            
+            resp = requests.get(url, headers=headers, timeout=15)
+            
+            if resp.status_code != 200:
+                logger.warning(f"⚠️ Stooq HTTP {resp.status_code}: {url}")
+                continue
+            
+            text = resp.text.strip()
+            
+            # Boş veya hatalı yanıt kontrolü
+            if not text or "404" in text or "not found" in text.lower():
+                continue
+            
+            lines_ = text.splitlines()
+            
+            # Başlık satırını bul
+            if not lines_ or "Date" not in lines_[0]:
+                continue
+            
+            # CSV başlığını parse et
+            header = [col.strip() for col in lines_[0].split(",")]
+            
+            # Sütun indekslerini bul (esnek)
+            date_idx = 0
+            high_idx = 2
+            low_idx = 3
+            
+            for idx, col in enumerate(header):
+                col_lower = col.lower()
+                if col_lower == "date":
+                    date_idx = idx
+                elif col_lower == "high":
+                    high_idx = idx
+                elif col_lower == "low":
+                    low_idx = idx
+            
+            bars = []
+            for line in lines_[1:]:
+                if not line.strip():
+                    continue
+                    
+                parts = [p.strip() for p in line.split(",")]
+                
+                # Yeterli sütun var mı?
+                if len(parts) <= max(date_idx, high_idx, low_idx):
+                    continue
+                
+                try:
+                    # Tarih kontrolü
+                    date_str = parts[date_idx]
+                    if not date_str or len(date_str) < 8:
+                        continue
+                    
+                    # Değerleri dönüştür
+                    high_val = float(parts[high_idx]) if parts[high_idx] else 0
+                    low_val = float(parts[low_idx]) if parts[low_idx] else 0
+                    
+                    if high_val > 0 and low_val > 0:
+                        bars.append({
+                            "datetime": date_str,
+                            "high": high_val,
+                            "low": low_val,
+                        })
+                except (ValueError, IndexError) as e:
+                    logger.debug(f"Stooq satır parse hatası: {e} - {line[:50]}")
+                    continue
+            
+            if bars:
+                logger.info(f"✅ Stooq'dan {len(bars)} veri alındı (URL: {url})")
+                return bars[-outputsize:] if len(bars) > outputsize else bars
+            else:
+                logger.warning(f"⚠️ Stooq veri bulunamadı: {url}")
+                
+        except requests.exceptions.Timeout:
+            logger.warning(f"⏰ Stooq timeout: {url_template}")
             continue
-
-    if not bars:
-        raise ValueError(f"Stooq: '{user_symbol}' için ayrıştırılabilir veri bulunamadı.")
-
-    return bars[-outputsize:] if len(bars) > outputsize else bars
+        except Exception as e:
+            logger.warning(f"⚠️ Stooq hatası: {e} - {url_template}")
+            continue
+    
+    raise ValueError(f"Stooq: '{user_symbol}' için tüm URL'ler başarısız oldu.")
 
 
 # ----------------------------------------------------------------------------
@@ -272,8 +354,11 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
     """
     normalized_input = user_symbol.strip().upper().replace(" ", "")
 
+    # 1) XAUTRYG (Gram Altın) türetme
     if normalized_input in ("XAUTRYG", "GRAMALTIN"):
         # Formül: (XAUUSD / 31.1034768) * USDTRY
+        logger.info(f"🔄 {user_symbol} türetiliyor (XAUUSD + USDTRY)")
+        
         xau_bars = fetch_bars("XAUUSD", interval, outputsize)
         usdtry_bars = fetch_bars("USDTRY", interval, outputsize)
         usdtry_by_date = {b["datetime"]: b for b in usdtry_bars}
@@ -291,11 +376,14 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
 
         if not result:
             raise ValueError("XAUTRYG için XAUUSD ve USDTRY tarihleri eşleştirilemedi.")
+        logger.info(f"✅ XAUTRYG türetildi: {len(result)} veri")
         return result
 
+    # 2) BIST endeksleri
     if normalized_input in BIST_INDEX_ALIASES:
         return fetch_bars_bist_index(user_symbol, interval, outputsize)
 
+    # 3) Twelve Data + Stooq yedek
     try:
         return fetch_bars_twelvedata(user_symbol, interval, outputsize)
     except ValueError as e:
@@ -468,6 +556,7 @@ def calculate_all_periods(user_symbol: str) -> dict:
             raise ValueError("Yeterli 4 saatlik veri bulunamadı.")
         results["4 Saatlik"] = _levels_from_bars([last_bar], birim="adet 4 saatlik mum")
     except Exception as e:
+        logger.error(f"4 Saatlik hesaplama hatası: {e}")
         results["4 Saatlik"] = {"hata": str(e)}
 
     # --- Günlük, Haftalık, Aylık (günlük mumlar) ---
@@ -476,6 +565,7 @@ def calculate_all_periods(user_symbol: str) -> dict:
         daily_bars = fetch_bars(user_symbol, "1day", short_size)
         daily_bars = _filter_weekend_bars_if_not_crypto(daily_bars, user_symbol)
     except Exception as e:
+        logger.error(f"Günlük veri çekme hatası: {e}")
         error = {"hata": str(e)}
         results["Günlük"] = error
         results["Haftalık"] = error
@@ -487,6 +577,7 @@ def calculate_all_periods(user_symbol: str) -> dict:
             bars = _last_completed_day_bars(daily_bars, today)
             results["Günlük"] = _levels_from_bars(bars, birim="gün")
         except Exception as e:
+            logger.error(f"Günlük hesaplama hatası: {e}")
             results["Günlük"] = {"hata": str(e)}
 
         try:
@@ -494,12 +585,14 @@ def calculate_all_periods(user_symbol: str) -> dict:
             start, end = get_last_completed_week_range(today, is_crypto=is_crypto)
             results["Haftalık"] = _levels_from_bars(_filter_by_range(daily_bars, start, end), birim="gün")
         except Exception as e:
+            logger.error(f"Haftalık hesaplama hatası: {e}")
             results["Haftalık"] = {"hata": str(e)}
 
         try:
             start, end = get_last_completed_month_range(today)
             results["Aylık"] = _levels_from_bars(_filter_by_range(daily_bars, start, end), birim="gün")
         except Exception as e:
+            logger.error(f"Aylık hesaplama hatası: {e}")
             results["Aylık"] = {"hata": str(e)}
 
     # --- 6 Aylık, Yıllık (haftalık mumlar) ---
@@ -507,6 +600,7 @@ def calculate_all_periods(user_symbol: str) -> dict:
         long_size = _compute_long_weekly_outputsize(today)
         weekly_bars = fetch_bars(user_symbol, "1week", long_size)
     except Exception as e:
+        logger.error(f"Haftalık veri çekme hatası: {e}")
         error = {"hata": str(e)}
         results["6 Aylık"] = error
         results["Yıllık"] = error
@@ -517,12 +611,14 @@ def calculate_all_periods(user_symbol: str) -> dict:
             start, end = get_last_completed_half_year_range(today)
             results["6 Aylık"] = _levels_from_bars(_filter_by_range(weekly_bars, start, end), birim="hafta")
         except Exception as e:
+            logger.error(f"6 Aylık hesaplama hatası: {e}")
             results["6 Aylık"] = {"hata": str(e)}
 
         try:
             start, end = get_last_completed_year_range(today)
             results["Yıllık"] = _levels_from_bars(_filter_by_range(weekly_bars, start, end), birim="hafta")
         except Exception as e:
+            logger.error(f"Yıllık hesaplama hatası: {e}")
             results["Yıllık"] = {"hata": str(e)}
 
     return results
@@ -617,7 +713,11 @@ async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_symbol = update.message.text.strip()
     processing_msg = await update.message.reply_text(f"⏳ {user_symbol.upper()} hesaplanıyor...")
 
-    results = calculate_all_periods(user_symbol)
+    try:
+        results = calculate_all_periods(user_symbol)
+    except Exception as e:
+        await processing_msg.edit_text(f"❌ Hata: {str(e)}")
+        return
 
     separator = "━" * 24
     blocks = [f"💰 *{user_symbol.upper()}*", separator, ""]
@@ -632,23 +732,4 @@ async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await processing_msg.edit_text(message, parse_mode="Markdown")
     else:
         await processing_msg.delete()
-        await update.message.reply_text(f"💰 *{user_symbol.upper()}*\n{separator}", parse_mode="Markdown")
-        for period_name in PERIOD_NAMES:
-            block = format_period_block(period_name, results.get(period_name, {"hata": "sonuç yok"}))
-            await update.message.reply_text(block, parse_mode="Markdown")
-
-
-def main():
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN tanımlı değil. Ortam değişkenlerini kontrol edin.")
-
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_symbol))
-
-    logger.info("Bot başlatıldı, mesajlar bekleniyor...")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+        await update.message.reply_text(f"💰 *
