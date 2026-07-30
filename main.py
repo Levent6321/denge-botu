@@ -1,3 +1,4 @@
+import yfinance as yf
 """
 DENGE ARALIĞI TELEGRAM BOTU (4 Kaynaklı Hibrit Model)
 ============================================================================
