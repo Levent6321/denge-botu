@@ -1,11 +1,9 @@
-import yfinance as yf
 """
-DENGE ARALIĞI TELEGRAM BOTU (4 Kaynaklı Hibrit Model)
+DENGE ARALIĞI TELEGRAM BOTU (3 Kaynaklı Hibrit Model)
 ============================================================================
 1) Twelve Data      -> BTCUSD, XAUUSD, EURUSD gibi standart forex/kripto/emtia
 2) isyatirimhisse    -> XU100, XU030, XU500 gibi BIST endeksleri (İş Yatırım)
-3) Yahoo Finance     -> XAGUSD, XPTUSD, XPDUSD, VIX, DXY (ANA YEDEK)
-4) Stooq (son çare)  -> Twelve Data ve Yahoo başarısız olursa
+3) Yahoo Finance     -> XAGUSD, XPTUSD, XPDUSD, VIX, DXY (YEDEK KAYNAK)
 XAUTRYG (Gram Altın/TL) ise XAUUSD ve USDTRY üzerinden TÜRETİLİR.
 """
 
@@ -69,17 +67,6 @@ def normalize_symbol(user_symbol: str) -> str:
     return s
 
 
-def _normalize_stooq_symbol(user_symbol: str) -> str:
-    """Kullanıcı girdisini Stooq formatına çevirir (yedek kaynak için)."""
-    s = user_symbol.strip().upper().replace(" ", "")
-
-    if s in ("VIX", "VIXUSD"):
-        return "^vix"
-    if s in ("DXY", "DXYUSD"):
-        return "usdx"
-    return s.replace("/", "").lower()
-
-
 def _normalize_yahoo_symbol(user_symbol: str) -> str:
     """Kullanıcı girdisini Yahoo Finance formatına çevirir."""
     s = user_symbol.strip().upper().replace(" ", "")
@@ -92,12 +79,6 @@ def _normalize_yahoo_symbol(user_symbol: str) -> str:
         "VIXUSD": "^VIX",
         "DXY": "DX-Y.NYB",
         "DXYUSD": "DX-Y.NYB",
-        "BTCUSD": "BTC-USD",
-        "ETHUSD": "ETH-USD",
-        "EURUSD": "EURUSD=X",
-        "GBPUSD": "GBPUSD=X",
-        "USDTRY": "TRY=X",
-        "XAUUSD": "GC=F",
     }
     
     return yahoo_map.get(s, s)
@@ -125,6 +106,8 @@ def fetch_bars_twelvedata(user_symbol: str, interval: str, outputsize: int):
 
     if isinstance(data, dict) and data.get("status") == "error":
         msg = data.get("message", "")
+        # "plan" / "Grow" / "Venture" / "available starting" geçiyorsa
+        # -> bu sembol ücretsiz planda kapalı, yedek kaynağa geçilecek
         if any(word in msg.lower() for word in ["plan", "grow", "venture", "available starting"]):
             raise ValueError("UPGRADE_REQUIRED")
         raise ValueError(msg)
@@ -136,14 +119,11 @@ def fetch_bars_twelvedata(user_symbol: str, interval: str, outputsize: int):
 
 
 # ----------------------------------------------------------------------------
-# VERİ ÇEKME - YAHOO FINANCE (YEDEK KAYNAK)
+# VERİ ÇEKME - YAHOO FINANCE (XAGUSD, XPTUSD, XPDUSD, VIX, DXY İÇİN)
 # ----------------------------------------------------------------------------
 
 def fetch_bars_yahoo(user_symbol: str, interval: str, outputsize: int):
-    """
-    Yahoo Finance'den veri çeker.
-    Özellikle XAGUSD, XPTUSD, XPDUSD, VIX, DXY için kullanılır.
-    """
+    """Yahoo Finance'den veri çeker (XAGUSD, XPTUSD, XPDUSD, VIX, DXY için)."""
     yahoo_symbol = _normalize_yahoo_symbol(user_symbol)
     
     interval_map = {
@@ -158,8 +138,6 @@ def fetch_bars_yahoo(user_symbol: str, interval: str, outputsize: int):
         period = "5d"
     else:
         period = f"{outputsize * 2}d" if interval == "1day" else f"{outputsize * 2}wk"
-    
-    logger.info(f"📊 Yahoo Finance çağrısı: {yahoo_symbol} {yf_interval}")
     
     try:
         ticker = yf.Ticker(yahoo_symbol)
@@ -181,7 +159,6 @@ def fetch_bars_yahoo(user_symbol: str, interval: str, outputsize: int):
         if not result:
             raise ValueError("Veri boş geldi")
             
-        logger.info(f"✅ Yahoo Finance'dan {len(result)} veri alındı")
         return result
         
     except Exception as e:
@@ -192,6 +169,8 @@ def fetch_bars_yahoo(user_symbol: str, interval: str, outputsize: int):
 # VERİ ÇEKME - BIST ENDEKSLERİ: isyatirimhisse (İş Yatırım)
 # ----------------------------------------------------------------------------
 
+# XU100/XU030/XU500 gibi BIST endeksleri Twelve Data'da hiç bulunmuyor.
+# Bunlar için doğrudan İş Yatırım'ın verisi (isyatirimhisse) kullanılır.
 BIST_INDEX_ALIASES = {
     "XU100": "XU100", "BIST100": "XU100",
     "XU030": "XU030", "XU30": "XU030", "BIST30": "XU030",
@@ -200,41 +179,42 @@ BIST_INDEX_ALIASES = {
 
 
 def _normalize_date_str(raw) -> str:
+    """isyatirimhisse'den gelen tarihi 'YYYY-MM-DD' formatına çevirir
+    (kaynak GG-AA-YYYY, GG.AA.YYYY ya da zaten ISO olabilir)."""
     raw = str(raw).strip()
     if len(raw) >= 10 and raw[4] == "-" and raw[7] == "-":
         return raw[:10]
     for sep in ("-", ".", "/"):
         parts = raw.split(sep)
         if len(parts) == 3:
-            if len(parts[2]) == 4:
+            if len(parts[2]) == 4:  # GG-AA-YYYY
                 gg, aa, yyyy = parts
                 return f"{yyyy}-{aa.zfill(2)}-{gg.zfill(2)}"
-            if len(parts[0]) == 4:
+            if len(parts[0]) == 4:  # YYYY-AA-GG
                 yyyy, aa, gg = parts
                 return f"{yyyy}-{aa.zfill(2)}-{gg.zfill(2)}"
     raise ValueError(f"Tarih formatı tanınamadı: {raw}")
 
 
 def fetch_bars_bist_index(user_symbol: str, interval: str, outputsize: int):
+    """BIST endeksleri (XU100/XU030/XU500) için İş Yatırım'dan veri çeker.
+    Bu kaynakta gün-içi (4 saatlik) veri YOKTUR."""
     if interval == "4h":
         raise ValueError("İş Yatırım kaynağında 4 saatlik veri yok.")
 
     if isyatirimhisse is None:
-        raise ValueError("isyatirimhisse kütüphanesi kurulu değil. Lütfen 'pip install isyatirimhisse' yapın veya GitHub'dan kurun.")
+        raise ValueError("isyatirimhisse kütüphanesi kurulu değil. Lütfen 'pip install isyatirimhisse' yapın.")
 
     index_code = BIST_INDEX_ALIASES[user_symbol.strip().upper().replace(" ", "")]
 
     today = datetime.now(TR_TZ).date()
-    start = today - timedelta(days=800)
+    start = today - timedelta(days=800)  # ~2.2 yıl geriye, yıllık ihtiyacı karşılar
 
-    try:
-        df = isyatirimhisse.fetch_index_data(
-            indices=index_code,
-            start_date=start.strftime("%d-%m-%Y"),
-            end_date=today.strftime("%d-%m-%Y"),
-        )
-    except Exception as e:
-        raise ValueError(f"İş Yatırım hatası: {e}")
+    df = isyatirimhisse.fetch_index_data(
+        indices=index_code,
+        start_date=start.strftime("%d-%m-%Y"),
+        end_date=today.strftime("%d-%m-%Y"),
+    )
 
     if df is None or df.empty:
         raise ValueError(f"İş Yatırım'dan '{user_symbol}' için veri alınamadı.")
@@ -271,51 +251,12 @@ def fetch_bars_bist_index(user_symbol: str, interval: str, outputsize: int):
 
 
 # ----------------------------------------------------------------------------
-# VERİ ÇEKME - YEDEK KAYNAK: Stooq (son çare)
-# ----------------------------------------------------------------------------
-
-def fetch_bars_stooq(user_symbol: str, interval: str, outputsize: int):
-    if interval == "4h":
-        raise ValueError("Stooq kaynağında 4 saatlik veri yok.")
-
-    stooq_interval = "w" if interval == "1week" else "d"
-    symbol = _normalize_stooq_symbol(user_symbol)
-    url = f"https://stooq.com/q/d/l/?s={symbol}&i={stooq_interval}"
-
-    try:
-        resp = requests.get(url, timeout=15)
-    except Exception as e:
-        raise ValueError(f"Stooq'a bağlanılamadı: {e}")
-
-    text = resp.text.strip()
-    lines_ = text.splitlines()
-    if not lines_ or "Date" not in lines_[0]:
-        raise ValueError(f"Stooq: '{user_symbol}' için veri alınamadı (sembol bulunamadı olabilir).")
-
-    bars = []
-    for line in lines_[1:]:
-        parts = line.split(",")
-        if len(parts) < 5:
-            continue
-        try:
-            bars.append({
-                "datetime": parts[0],
-                "high": float(parts[2]),
-                "low": float(parts[3]),
-            })
-        except ValueError:
-            continue
-
-    if not bars:
-        raise ValueError(f"Stooq: '{user_symbol}' için ayrıştırılabilir veri bulunamadı.")
-
-    return bars[-outputsize:] if len(bars) > outputsize else bars
-
-
-# ----------------------------------------------------------------------------
 # ANA fetch_bars FONKSİYONU
 # ----------------------------------------------------------------------------
 
+# 1 ons = 31.1034768 gram. XAUTRYG (Gram Altın/TL) hiçbir sağlayıcıda tek bir
+# sembol olarak bulunmuyor; (XAU/USD / 31.1034768) * USD/TRY formülüyle
+# TÜRETİLİR.
 GRAMS_PER_TROY_OUNCE = 31.1034768
 
 
@@ -324,9 +265,9 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
     Sıralama:
       1) XAUTRYG -> XAUUSD ve USDTRY üzerinden TÜRETİLİR.
       2) XU100/XU030/XU500 -> doğrudan isyatirimhisse (İş Yatırım).
-      3) XAGUSD, XPTUSD, XPDUSD, VIX, DXY -> Yahoo Finance
+      3) XAGUSD, XPTUSD, XPDUSD, VIX, DXY -> Yahoo Finance (öncelikli)
       4) Diğer her şey -> önce Twelve Data; 'UPGRADE_REQUIRED' hatası
-         alırsa Yahoo Finance denenir, o da olmazsa Stooq denenir.
+         alırsa Yahoo Finance denenir.
     """
     normalized_input = user_symbol.strip().upper().replace(" ", "")
 
@@ -357,13 +298,9 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
 
     # 3) Yahoo Finance öncelikli semboller (XAGUSD, XPTUSD, XPDUSD, VIX, DXY)
     if normalized_input in ["XAGUSD", "XPTUSD", "XPDUSD", "VIX", "DXY"]:
-        try:
-            return fetch_bars_yahoo(user_symbol, interval, outputsize)
-        except Exception as e:
-            logger.warning(f"Yahoo Finance başarısız: {e}")
-            return fetch_bars_stooq(user_symbol, interval, outputsize)
+        return fetch_bars_yahoo(user_symbol, interval, outputsize)
 
-    # 4) Twelve Data + yedekler
+    # 4) Twelve Data + yedek
     try:
         return fetch_bars_twelvedata(user_symbol, interval, outputsize)
     except ValueError as e:
@@ -372,14 +309,9 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
             try:
                 return fetch_bars_yahoo(user_symbol, interval, outputsize)
             except Exception as yahoo_err:
-                logger.warning(f"Yahoo Finance başarısız: {yahoo_err}")
-                try:
-                    logger.info(f"🔄 Stooq deneniyor...")
-                    return fetch_bars_stooq(user_symbol, interval, outputsize)
-                except Exception as stooq_err:
-                    raise ValueError(
-                        f"Twelve Data ücretsiz planda kapalı; Yahoo Finance ve Stooq da başarısız oldu: {stooq_err}"
-                    )
+                raise ValueError(
+                    f"Twelve Data ücretsiz planda kapalı; Yahoo Finance de başarısız oldu: {yahoo_err}"
+                )
         raise
 
 
