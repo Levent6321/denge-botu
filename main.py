@@ -1,9 +1,12 @@
 """
-DENGE ARALIĞI TELEGRAM BOTU (Hibrit Model - Twelve Data + yfinance yedekli)
+DENGE ARALIĞI TELEGRAM BOTU (3 Kaynaklı Hibrit Model)
 ============================================================================
-Clab'ın orijinal kodu korundu. Sadece XAGUSD gibi ücretsiz planda kapalı
-semboller için yfinance yedek kaynak olarak eklendi.
-BTCUSD, XAUUSD, EURUSD gibi çalışan semboller hâlâ Twelve Data'dan çekilir.
+1) Twelve Data      -> BTCUSD, XAUUSD, EURUSD gibi standart forex/kripto/emtia
+2) isyatirimhisse    -> XU100, XU030, XU500 gibi BIST endeksleri (İş Yatırım)
+3) Stooq (yedek)     -> Twelve Data'da ücretsiz planda kapalı olan XAGUSD,
+                        XPTUSD, XPDUSD, VIX, DXY gibi semboller için denenir
+                        (garantisi yoktur, Twelve Data reddederse devreye girer)
+XAUTRYG (Gram Altın/TL) ise XAUUSD ve USDTRY üzerinden TÜRETİLİR.
 """
 
 import os
@@ -14,10 +17,14 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
-import yfinance as yf
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+try:
+    import isyatirimhisse
+except ImportError:
+    isyatirimhisse = None
 
 # ----------------------------------------------------------------------------
 # AYARLAR
@@ -61,41 +68,20 @@ def normalize_symbol(user_symbol: str) -> str:
     return s
 
 
-def _normalize_yfinance_symbol(user_symbol: str) -> str:
-    """Kullanıcı girdisini yfinance formatına çevirir (yedek kaynak için)."""
+def _normalize_stooq_symbol(user_symbol: str) -> str:
+    """Kullanıcı girdisini Stooq formatına çevirir (yedek kaynak için)."""
     s = user_symbol.strip().upper().replace(" ", "")
 
-    # DXY özel durumu
-    if s in ("DXY", "DXYUSD"):
-        return "DX-Y.NYB"
-
-    # VIX özel durumu
+    # VIX özel durumu (endeksler Stooq'ta '^' öneki alır)
     if s in ("VIX", "VIXUSD"):
-        return "^VIX"
+        return "^vix"
 
-    # BIST endeksleri özel durumu
-    if s in ("XU100", "BIST100"):
-        return "^XU100"
-    if s in ("XU030", "XU30", "BIST30"):
-        return "^XU030"
+    # DXY: Stooq'ta net teyit edilemedi, en olası tahmin denenir
+    if s in ("DXY", "DXYUSD"):
+        return "usdx"
 
-    if "/" in s:
-        base, quote = s.split("/")
-    elif len(s) > 3:
-        base, quote = s[:-3], s[-3:]
-    else:
-        return s
-
-    # Emtialar (XAG, XAU, XPT, XPD) -> =X eki
-    if base in ("XAU", "XAG", "XPT", "XPD"):
-        return f"{base}{quote}=X"
-    # Forex majörleri -> =X eki
-    forex_bases = {"EUR", "GBP", "USD", "JPY", "CHF", "AUD", "NZD", "CAD"}
-    forex_quotes = {"USD", "EUR", "GBP", "JPY", "CHF", "AUD", "NZD", "CAD"}
-    if base in forex_bases and quote in forex_quotes:
-        return f"{base}{quote}=X"
-    # Kripto ve hisseler -> - formatı
-    return f"{base}-{quote}"
+    # Forex/emtia genel formatı: küçük harf, ayraçsız (xauusd, xagusd, xptusd, xpdusd vb.)
+    return s.replace("/", "").lower()
 
 
 # ----------------------------------------------------------------------------
@@ -133,82 +119,142 @@ def fetch_bars_twelvedata(user_symbol: str, interval: str, outputsize: int):
 
 
 # ----------------------------------------------------------------------------
-# VERİ ÇEKME - YEDEK KAYNAK: yfinance (sadece Twelve Data başarısız olursa)
+# VERİ ÇEKME - BIST ENDEKSLERİ: isyatirimhisse (İş Yatırım)
 # ----------------------------------------------------------------------------
 
-def fetch_bars_yfinance(user_symbol: str, interval: str, outputsize: int):
+# XU100/XU030/XU500 gibi BIST endeksleri Twelve Data'da hiç bulunmuyor.
+# Bunlar için doğrudan İş Yatırım'ın verisi (isyatirimhisse) kullanılır.
+BIST_INDEX_ALIASES = {
+    "XU100": "XU100", "BIST100": "XU100",
+    "XU030": "XU030", "XU30": "XU030", "BIST30": "XU030",
+    "XU500": "XU500", "BIST500": "XU500",
+}
+
+
+def _normalize_date_str(raw) -> str:
+    """isyatirimhisse'den gelen tarihi 'YYYY-MM-DD' formatına çevirir
+    (kaynak GG-AA-YYYY, GG.AA.YYYY ya da zaten ISO olabilir)."""
+    raw = str(raw).strip()
+    if len(raw) >= 10 and raw[4] == "-" and raw[7] == "-":
+        return raw[:10]
+    for sep in ("-", ".", "/"):
+        parts = raw.split(sep)
+        if len(parts) == 3:
+            if len(parts[2]) == 4:  # GG-AA-YYYY
+                gg, aa, yyyy = parts
+                return f"{yyyy}-{aa.zfill(2)}-{gg.zfill(2)}"
+            if len(parts[0]) == 4:  # YYYY-AA-GG
+                yyyy, aa, gg = parts
+                return f"{yyyy}-{aa.zfill(2)}-{gg.zfill(2)}"
+    raise ValueError(f"Tarih formatı tanınamadı: {raw}")
+
+
+def fetch_bars_bist_index(user_symbol: str, interval: str, outputsize: int):
+    """BIST endeksleri (XU100/XU030/XU500) için İş Yatırım'dan veri çeker.
+    Bu kaynakta gün-içi (4 saatlik) veri YOKTUR."""
+    if interval == "4h":
+        raise ValueError("İş Yatırım kaynağında 4 saatlik veri yok.")
+
+    if isyatirimhisse is None:
+        raise ValueError("isyatirimhisse kütüphanesi kurulu değil.")
+
+    index_code = BIST_INDEX_ALIASES[user_symbol.strip().upper().replace(" ", "")]
+
+    today = datetime.now(TR_TZ).date()
+    start = today - timedelta(days=800)  # ~2.2 yıl geriye, yıllık ihtiyacı karşılar
+
+    df = isyatirimhisse.fetch_index_data(
+        indices=index_code,
+        start_date=start.strftime("%d-%m-%Y"),
+        end_date=today.strftime("%d-%m-%Y"),
+    )
+
+    if df is None or df.empty:
+        raise ValueError(f"İş Yatırım'dan '{user_symbol}' için veri alınamadı.")
+
+    date_col = next((c for c in df.columns if "tarih" in c.lower() or "date" in c.lower()), None)
+    high_col = next((c for c in df.columns if "yuksek" in c.lower() or "high" in c.lower()), None)
+    low_col = next((c for c in df.columns if "dusuk" in c.lower() or "low" in c.lower()), None)
+    close_col = next(
+        (c for c in df.columns if any(k in c.lower() for k in ("kapanis", "close", "deger", "value", index_code.lower()))),
+        None,
+    )
+
+    if date_col is None or (close_col is None and (high_col is None or low_col is None)):
+        raise ValueError(f"İş Yatırım verisi beklenmeyen formatta (sütunlar: {list(df.columns)}).")
+
+    bars = []
+    for _, row in df.iterrows():
+        try:
+            dt_str = _normalize_date_str(row[date_col])
+            close_val = float(row[close_col]) if close_col else None
+            high_val = float(row[high_col]) if high_col else close_val
+            low_val = float(row[low_col]) if low_col else close_val
+            if high_val is None or low_val is None:
+                continue
+            bars.append({"datetime": dt_str, "high": high_val, "low": low_val})
+        except Exception:
+            continue
+
+    if not bars:
+        raise ValueError(f"'{user_symbol}' için ayrıştırılabilir veri bulunamadı.")
+
+    bars.sort(key=lambda b: b["datetime"])
+    return bars[-outputsize:] if len(bars) > outputsize else bars
+
+
+# ----------------------------------------------------------------------------
+# VERİ ÇEKME - YEDEK KAYNAK: Stooq (sadece Twelve Data başarısız olursa)
+# ----------------------------------------------------------------------------
+
+def fetch_bars_stooq(user_symbol: str, interval: str, outputsize: int):
     """
     Yedek veri kaynağı. Sadece Twelve Data 'UPGRADE_REQUIRED' hatası
     verdiğinde (ücretsiz planda kapalı semboller için) çağrılır.
+    Stooq'ta gün-içi (4 saatlik) veri YOKTUR, sadece günlük/haftalık.
+    NOT: Stooq'un resmi API'si yoktur, bu basit CSV linkine dayanır;
+    bazı semboller (özellikle DXY) garantili çalışmayabilir.
     """
-    symbol = _normalize_yfinance_symbol(user_symbol)
-
     if interval == "4h":
-        return _fetch_4h_yfinance(symbol, outputsize)
-    elif interval == "1day":
-        return _fetch_daily_yfinance(symbol, outputsize)
-    elif interval == "1week":
-        return _fetch_weekly_yfinance(symbol, outputsize)
-    else:
-        raise ValueError(f"yfinance desteklenmeyen interval: {interval}")
+        raise ValueError("Stooq kaynağında 4 saatlik veri yok.")
 
+    stooq_interval = "w" if interval == "1week" else "d"
+    symbol = _normalize_stooq_symbol(user_symbol)
+    url = f"https://stooq.com/q/d/l/?s={symbol}&i={stooq_interval}"
 
-def _fetch_daily_yfinance(symbol: str, outputsize: int):
-    ticker = yf.Ticker(symbol)
-    end = datetime.now(TR_TZ)
-    start = end - timedelta(days=outputsize + 10)
-    df = ticker.history(start=start, end=end, interval="1d")
+    try:
+        resp = requests.get(url, timeout=15)
+    except Exception as e:
+        raise ValueError(f"Stooq'a bağlanılamadı: {e}")
 
-    if df.empty:
-        raise ValueError(f"yfinance: '{symbol}' için günlük veri bulunamadı")
+    text = resp.text.strip()
+    lines_ = text.splitlines()
+    if not lines_ or "Date" not in lines_[0]:
+        raise ValueError(f"Stooq: '{user_symbol}' için veri alınamadı (sembol bulunamadı olabilir).")
 
-    return [
-        {"datetime": idx.strftime("%Y-%m-%d"), "high": float(row["High"]), "low": float(row["Low"])}
-        for idx, row in df.tail(outputsize).iterrows()
-    ]
+    bars = []
+    for line in lines_[1:]:
+        parts = line.split(",")
+        if len(parts) < 5:
+            continue
+        try:
+            bars.append({
+                "datetime": parts[0],
+                "high": float(parts[2]),
+                "low": float(parts[3]),
+            })
+        except ValueError:
+            continue
 
+    if not bars:
+        raise ValueError(f"Stooq: '{user_symbol}' için ayrıştırılabilir veri bulunamadı.")
 
-def _fetch_weekly_yfinance(symbol: str, outputsize: int):
-    ticker = yf.Ticker(symbol)
-    end = datetime.now(TR_TZ)
-    start = end - timedelta(weeks=outputsize + 5)
-    df = ticker.history(start=start, end=end, interval="1wk")
-
-    if df.empty:
-        raise ValueError(f"yfinance: '{symbol}' için haftalık veri bulunamadı")
-
-    return [
-        {"datetime": idx.strftime("%Y-%m-%d"), "high": float(row["High"]), "low": float(row["Low"])}
-        for idx, row in df.tail(outputsize).iterrows()
-    ]
-
-
-def _fetch_4h_yfinance(symbol: str, outputsize: int):
-    ticker = yf.Ticker(symbol)
-    end = datetime.now(TR_TZ)
-    start = end - timedelta(hours=(outputsize + 1) * 4 + 10)
-    df = ticker.history(start=start, end=end, interval="1h")
-
-    if df.empty:
-        raise ValueError(f"yfinance: '{symbol}' için 4 saatlik veri bulunamadı")
-
-    df_4h = df.resample("4h").agg({
-        "Open": "first", "High": "max", "Low": "min", "Close": "last"
-    }).dropna()
-
-    return [
-        {"datetime": idx.strftime("%Y-%m-%d %H:%M:%S"), "high": float(row["High"]), "low": float(row["Low"])}
-        for idx, row in df_4h.tail(outputsize).iterrows()
-    ]
+    return bars[-outputsize:] if len(bars) > outputsize else bars
 
 
 # ----------------------------------------------------------------------------
-# ANA fetch_bars FONKSİYONU (Önce Twelve Data, başarısızsa yfinance)
+# ANA fetch_bars FONKSİYONU
 # ----------------------------------------------------------------------------
-
-# Twelve Data'nın hiç taşımadığı (BIST endeksleri gibi) semboller.
-# Bunlar için Twelve Data'yı denemeden direkt yfinance'e gidilir.
-YFINANCE_ONLY_SYMBOLS = {"XU100", "BIST100", "XU030", "XU30", "BIST30"}
 
 # 1 ons = 31.1034768 gram. XAUTRYG (Gram Altın/TL) hiçbir sağlayıcıda tek bir
 # sembol olarak bulunmuyor; (XAU/USD / 31.1034768) * USD/TRY formülüyle
@@ -218,13 +264,11 @@ GRAMS_PER_TROY_OUNCE = 31.1034768
 
 def fetch_bars(user_symbol: str, interval: str, outputsize: int):
     """
-    Önce Twelve Data'yı dener.
-    Eğer 'UPGRADE_REQUIRED' hatası alırsa (ücretsiz planda kapalı sembol),
-    otomatik olarak yfinance yedek kaynağına geçer.
-    XU100/XU030 gibi Twelve Data'da hiç bulunmayan semboller için
-    Twelve Data hiç denenmeden direkt yfinance kullanılır.
-    XAUTRYG (Gram Altın/TL) ise XAU/TRY üzerinden TÜRETİLİR (gerçek bir
-    sembol değil, ons fiyatı 31.1034768'e bölünerek gram fiyatı elde edilir).
+    Sıralama:
+      1) XAUTRYG -> XAUUSD ve USDTRY üzerinden TÜRETİLİR.
+      2) XU100/XU030/XU500 -> doğrudan isyatirimhisse (İş Yatırım).
+      3) Diğer her şey -> önce Twelve Data; 'UPGRADE_REQUIRED' hatası
+         alırsa (ücretsiz planda kapalı sembol) Stooq denenir (garantisiz).
     """
     normalized_input = user_symbol.strip().upper().replace(" ", "")
 
@@ -249,15 +293,20 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
             raise ValueError("XAUTRYG için XAUUSD ve USDTRY tarihleri eşleştirilemedi.")
         return result
 
-    if normalized_input in YFINANCE_ONLY_SYMBOLS:
-        return fetch_bars_yfinance(user_symbol, interval, outputsize)
+    if normalized_input in BIST_INDEX_ALIASES:
+        return fetch_bars_bist_index(user_symbol, interval, outputsize)
 
     try:
         return fetch_bars_twelvedata(user_symbol, interval, outputsize)
     except ValueError as e:
         if str(e) == "UPGRADE_REQUIRED":
-            logger.info(f"🔄 '{user_symbol}' Twelve Data ücretsiz planda kapalı, yfinance deneniyor...")
-            return fetch_bars_yfinance(user_symbol, interval, outputsize)
+            logger.info(f"🔄 '{user_symbol}' Twelve Data ücretsiz planda kapalı, Stooq deneniyor...")
+            try:
+                return fetch_bars_stooq(user_symbol, interval, outputsize)
+            except Exception as stooq_err:
+                raise ValueError(
+                    f"Twelve Data ücretsiz planda kapalı; Stooq denemesi de başarısız oldu: {stooq_err}"
+                )
         raise
 
 
@@ -506,7 +555,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✨ *Denge Aralığı Botu* ✨\n\n"
         "Bana bir enstrüman kodu gönder (örn: *BTCUSD*, *XAUUSD*, *XAGUSD*, *XPTUSD*, "
-        "*XPDUSD*, *EURUSD*, *DXY*, *VIX*, *XU100*, *XU030*, *XAUTRYG*).\n\n"
+        "*XPDUSD*, *EURUSD*, *DXY*, *VIX*, *XU100*, *XU030*, *XU500*, *XAUTRYG*).\n\n"
         "🕐 Günlük  📅 Haftalık  🗓️ Aylık  📈 6 Aylık  🏆 Yıllık\n"
         "için Denge (Medyan), Aritmetik Ortalama, Direnç 1/2 ve Destek 1/2 "
         "seviyelerini hesaplayayım.\n\n"
