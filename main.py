@@ -252,7 +252,12 @@ def fetch_bars_bist_index(user_symbol: str, interval: str, outputsize: int):
             low_val = float(row[low_col]) if low_col else close_val
             if high_val is None or low_val is None:
                 continue
-            bars.append({"datetime": dt_str, "high": high_val, "low": low_val})
+            bars.append({
+                "datetime": dt_str,
+                "high": high_val,
+                "low": low_val,
+                "close": close_val if close_val is not None else (high_val + low_val) / 2,
+            })
         except Exception:
             continue
 
@@ -312,11 +317,14 @@ def _fetch_bars_stooq_uncached(user_symbol: str, interval: str, outputsize: int)
         if len(parts) < 5:
             continue
         try:
-            bars.append({
+            bar = {
                 "datetime": parts[0],
                 "high": float(parts[2]),
                 "low": float(parts[3]),
-            })
+            }
+            if len(parts) > 4 and parts[4]:
+                bar["close"] = float(parts[4])
+            bars.append(bar)
         except ValueError:
             continue
 
@@ -420,6 +428,7 @@ def _fetch_bars_yfinance_uncached(user_symbol: str, interval: str, outputsize: i
                             "datetime": idx.strftime("%Y-%m-%d"),
                             "high": float(row["High"]),
                             "low": float(row["Low"]),
+                            "close": float(row["Close"]),
                         })
                     except (TypeError, ValueError):
                         continue
@@ -484,10 +493,13 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
             ub = usdtry_by_date.get(xb["datetime"])
             if ub is None:
                 continue  # o tarihte eşleşen USDTRY verisi yoksa bu günü atla
+            xb_close = xb.get("close", (float(xb["high"]) + float(xb["low"])) / 2)
+            ub_close = ub.get("close", (float(ub["high"]) + float(ub["low"])) / 2)
             result.append({
                 "datetime": xb["datetime"],
                 "high": (float(xb["high"]) / GRAMS_PER_TROY_OUNCE) * float(ub["high"]),
                 "low": (float(xb["low"]) / GRAMS_PER_TROY_OUNCE) * float(ub["low"]),
+                "close": (float(xb_close) / GRAMS_PER_TROY_OUNCE) * float(ub_close),
             })
 
         if not result:
@@ -559,6 +571,71 @@ def get_last_completed_year_range(today: date):
 
 
 # ----------------------------------------------------------------------------
+# HEDEF DÖNEM SINIRLARI
+# ----------------------------------------------------------------------------
+# Denge aralığı mantığı: bir önceki TAMAMLANMIŞ dönemin (gün/hafta/ay/...)
+# verisinden hesaplanan Denge/Ortalama/Direnç/Destek seviyeleri, o dönemin
+# kendisi için değil, BİR SONRAKİ (şu an içinde bulunulan / gelecek) dönem
+# için geçerlidir. Örn: Temmuz'un günlük mumlarından hesaplanan Aylık
+# seviyeler, Ağustos ayı boyunca kullanılacak seviyelerdir.
+# Bu yüzden ekranda gösterilen tarih aralığı, verinin geldiği dönem değil,
+# seviyelerin GEÇERLİ OLDUĞU (hedef) dönem olmalıdır.
+
+def get_current_day_range(today: date):
+    return today, today
+
+
+def get_current_week_range(today: date, is_crypto: bool = False):
+    weekday = today.weekday()
+    if is_crypto:
+        monday = today - timedelta(days=weekday)
+        sunday = monday + timedelta(days=6)
+        return monday, sunday
+
+    if weekday >= 5:
+        # Hafta sonu: piyasa kapalı, hedef BİR SONRAKİ hafta (Pzt-Cum).
+        next_monday = today - timedelta(days=weekday) + timedelta(days=7)
+        next_friday = next_monday + timedelta(days=4)
+        return next_monday, next_friday
+
+    this_monday = today - timedelta(days=weekday)
+    this_friday = this_monday + timedelta(days=4)
+    return this_monday, this_friday
+
+
+def _next_trading_day(today: date, is_crypto: bool = False) -> date:
+    """Kripto için her gün işlem günüdür. Diğerlerinde hafta sonuysa
+    bir sonraki Pazartesi'ye kaydırılır (Günlük/4 Saatlik hedef tarihi için)."""
+    if is_crypto:
+        return today
+    d = today
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d
+
+
+def get_current_month_range(today: date):
+    first_of_month = today.replace(day=1)
+    if today.month == 12:
+        next_month_first = date(today.year + 1, 1, 1)
+    else:
+        next_month_first = date(today.year, today.month + 1, 1)
+    last_of_month = next_month_first - timedelta(days=1)
+    return first_of_month, last_of_month
+
+
+def get_current_half_year_range(today: date):
+    year = today.year
+    if today.month <= 6:
+        return date(year, 1, 1), date(year, 6, 30)
+    return date(year, 7, 1), date(year, 12, 31)
+
+
+def get_current_year_range(today: date):
+    return date(today.year, 1, 1), date(today.year, 12, 31)
+
+
+# ----------------------------------------------------------------------------
 # HESAPLAMA
 # ----------------------------------------------------------------------------
 
@@ -575,6 +652,17 @@ def _parse_bar_datetime(bar: dict) -> datetime:
 
 def _filter_by_range(bars, start: date, end: date):
     return [b for b in bars if start <= _parse_bar_date(b) <= end]
+
+
+def _bar_close(bar: dict) -> float:
+    """Bar içinde 'close' varsa onu, yoksa high/low ortalamasını döndürür."""
+    close_val = bar.get("close")
+    if close_val is not None:
+        try:
+            return float(close_val)
+        except (TypeError, ValueError):
+            pass
+    return (float(bar["high"]) + float(bar["low"])) / 2
 
 
 CRYPTO_BASES = {
@@ -670,16 +758,28 @@ def _compute_long_weekly_outputsize(today: date) -> int:
 
 def calculate_all_periods(user_symbol: str) -> dict:
     today = datetime.now(TR_TZ).date()
+    is_crypto = _is_crypto_symbol(user_symbol)
+    hedef_gun = _next_trading_day(today, is_crypto)
     results = {}
+
+    # Güncel fiyat: en taze veriden (önce 4 saatlik, olmazsa günlük) yakalanır.
+    guncel_fiyat = None
+    guncel_fiyat_zaman = None
 
     # --- 4 Saatlik ---
     try:
-        four_hour_bars = fetch_bars(user_symbol, "4h", FOUR_HOUR_OUTPUTSIZE)
-        four_hour_bars = _filter_weekend_bars_if_not_crypto(four_hour_bars, user_symbol)
+        four_hour_bars_raw = fetch_bars(user_symbol, "4h", FOUR_HOUR_OUTPUTSIZE)
+        four_hour_bars = _filter_weekend_bars_if_not_crypto(four_hour_bars_raw, user_symbol)
         last_bar = max(four_hour_bars, key=_parse_bar_datetime) if four_hour_bars else None
         if last_bar is None:
             raise ValueError("Yeterli 4 saatlik veri bulunamadı.")
         results["4 Saatlik"] = _levels_from_bars([last_bar], birim="adet 4 saatlik mum")
+        # Bu seviyeler son kapanan 4 saatlik mumdan hesaplanır ama BİR SONRAKİ
+        # 4 saatlik mum için geçerlidir; tarih etiketi bugünü gösterir.
+        results["4 Saatlik"]["baslangic"] = hedef_gun.isoformat()
+        results["4 Saatlik"]["bitis"] = hedef_gun.isoformat()
+        guncel_fiyat = _bar_close(last_bar)
+        guncel_fiyat_zaman = _parse_bar_datetime(last_bar)
     except Exception as e:
         results["4 Saatlik"] = {"hata": str(e)}
 
@@ -696,22 +796,36 @@ def calculate_all_periods(user_symbol: str) -> dict:
         daily_bars = None
 
     if daily_bars is not None:
+        if guncel_fiyat is None:
+            latest_daily_bar = max(daily_bars, key=_parse_bar_date) if daily_bars else None
+            if latest_daily_bar is not None:
+                guncel_fiyat = _bar_close(latest_daily_bar)
+                guncel_fiyat_zaman = _parse_bar_datetime(latest_daily_bar)
+
         try:
             bars = _last_completed_day_bars(daily_bars, today)
             results["Günlük"] = _levels_from_bars(bars, birim="gün")
+            # Son kapanan günden hesaplanır, BUGÜN için geçerlidir.
+            results["Günlük"]["baslangic"] = hedef_gun.isoformat()
+            results["Günlük"]["bitis"] = hedef_gun.isoformat()
         except Exception as e:
             results["Günlük"] = {"hata": str(e)}
 
         try:
-            is_crypto = _is_crypto_symbol(user_symbol)
             start, end = get_last_completed_week_range(today, is_crypto=is_crypto)
             results["Haftalık"] = _levels_from_bars(_filter_by_range(daily_bars, start, end), birim="gün")
+            hedef_start, hedef_end = get_current_week_range(today, is_crypto=is_crypto)
+            results["Haftalık"]["baslangic"] = hedef_start.isoformat()
+            results["Haftalık"]["bitis"] = hedef_end.isoformat()
         except Exception as e:
             results["Haftalık"] = {"hata": str(e)}
 
         try:
             start, end = get_last_completed_month_range(today)
             results["Aylık"] = _levels_from_bars(_filter_by_range(daily_bars, start, end), birim="gün")
+            hedef_start, hedef_end = get_current_month_range(today)
+            results["Aylık"]["baslangic"] = hedef_start.isoformat()
+            results["Aylık"]["bitis"] = hedef_end.isoformat()
         except Exception as e:
             results["Aylık"] = {"hata": str(e)}
 
@@ -729,15 +843,23 @@ def calculate_all_periods(user_symbol: str) -> dict:
         try:
             start, end = get_last_completed_half_year_range(today)
             results["6 Aylık"] = _levels_from_bars(_filter_by_range(weekly_bars, start, end), birim="hafta")
+            hedef_start, hedef_end = get_current_half_year_range(today)
+            results["6 Aylık"]["baslangic"] = hedef_start.isoformat()
+            results["6 Aylık"]["bitis"] = hedef_end.isoformat()
         except Exception as e:
             results["6 Aylık"] = {"hata": str(e)}
 
         try:
             start, end = get_last_completed_year_range(today)
             results["Yıllık"] = _levels_from_bars(_filter_by_range(weekly_bars, start, end), birim="hafta")
+            hedef_start, hedef_end = get_current_year_range(today)
+            results["Yıllık"]["baslangic"] = hedef_start.isoformat()
+            results["Yıllık"]["bitis"] = hedef_end.isoformat()
         except Exception as e:
             results["Yıllık"] = {"hata": str(e)}
 
+    results["_guncel_fiyat"] = guncel_fiyat
+    results["_guncel_fiyat_zaman"] = guncel_fiyat_zaman
     return results
 
 
@@ -789,7 +911,7 @@ def format_period_block(period_name: str, result: dict) -> str:
     if "hata" in result:
         return f"{icon} *{period_name}*\n⚠️ _{result['hata']}_"
 
-    birim_etiketi = f"{result['adet']} {result['birim']}"
+    birim_etiketi = f"{result['adet']} {result['birim']} verisiyle hesaplandı"
     tarih_araligi = f"{_format_tr_date(result['baslangic'])} → {_format_tr_date(result['bitis'])}"
 
     def row(label: str, value: float, emoji: str = "") -> str:
@@ -808,7 +930,9 @@ def format_period_block(period_name: str, result: dict) -> str:
     ])
 
     lines = [
-        f"{icon} *{period_name}*  _({birim_etiketi} · {tarih_araligi})_",
+        f"{icon} *{period_name}*",
+        f"_{birim_etiketi}_",
+        f"_📆 Geçerlilik: {tarih_araligi}_",
         f"```\n{table}\n```",
     ]
 
@@ -826,14 +950,37 @@ def format_period_block(period_name: str, result: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_current_price_line(guncel_fiyat, guncel_fiyat_zaman):
+    if guncel_fiyat is None:
+        return None
+    zaman_str = ""
+    if guncel_fiyat_zaman is not None:
+        if guncel_fiyat_zaman.time() == guncel_fiyat_zaman.min.time():
+            zaman_str = guncel_fiyat_zaman.strftime("%d.%m.%Y")
+        else:
+            zaman_str = guncel_fiyat_zaman.strftime("%d.%m.%Y %H:%M")
+    fiyat_str = f"{guncel_fiyat:,.2f}"
+    if zaman_str:
+        return f"💵 *Güncel Fiyat:* `{fiyat_str}`  _({zaman_str} itibarıyla)_"
+    return f"💵 *Güncel Fiyat:* `{fiyat_str}`"
+
+
 async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_symbol = update.message.text.strip()
     processing_msg = await update.message.reply_text(f"⏳ {user_symbol.upper()} hesaplanıyor...")
 
     results = calculate_all_periods(user_symbol)
+    guncel_fiyat_satiri = _format_current_price_line(
+        results.pop("_guncel_fiyat", None), results.pop("_guncel_fiyat_zaman", None)
+    )
 
     separator = "━" * 24
-    blocks = [f"💰 *{user_symbol.upper()}*", separator, ""]
+    header_blocks = [f"💰 *{user_symbol.upper()}*"]
+    if guncel_fiyat_satiri:
+        header_blocks.append(guncel_fiyat_satiri)
+    header_blocks.append(separator)
+
+    blocks = header_blocks + [""]
     for i, period_name in enumerate(PERIOD_NAMES):
         blocks.append(format_period_block(period_name, results.get(period_name, {"hata": "sonuç yok"})))
         if i < len(PERIOD_NAMES) - 1:
@@ -845,7 +992,7 @@ async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await processing_msg.edit_text(message, parse_mode="Markdown")
     else:
         await processing_msg.delete()
-        await update.message.reply_text(f"💰 *{user_symbol.upper()}*\n{separator}", parse_mode="Markdown")
+        await update.message.reply_text("\n".join(header_blocks), parse_mode="Markdown")
         for period_name in PERIOD_NAMES:
             block = format_period_block(period_name, results.get(period_name, {"hata": "sonuç yok"}))
             await update.message.reply_text(block, parse_mode="Markdown")
