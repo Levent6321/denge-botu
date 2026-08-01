@@ -7,9 +7,20 @@ DENGE ARALIĞI TELEGRAM BOTU (3 Kaynaklı Hibrit Model)
                         XPTUSD, XPDUSD, VIX, DXY gibi semboller için denenir
                         (garantisi yoktur, Twelve Data reddederse devreye girer)
 XAUTRYG (Gram Altın/TL) ise XAUUSD ve USDTRY üzerinden TÜRETİLİR.
+
+GÜNCELLEME NOTU: Stooq ve yfinance sık sık "Too Many Requests" (rate limit)
+hatası verdiği için şu iyileştirmeler eklendi:
+  - Her iki kaynağa da gerçek tarayıcı User-Agent'ı ile istek atılıyor.
+  - yfinance isteklerinde basit retry/backoff var.
+  - Sonuçlar kısa süreli (5 dk) bellek-içi önbellekte tutuluyor, böylece
+    aynı sembol için art arda gelen istekler (4 saatlik/günlük/haftalık/
+    aylık) gereksiz yere kaynağı tekrar tekrar yormuyor.
+  - "Too many requests / rate limit" durumu ayrı ve daha anlaşılır bir
+    hata mesajıyla kullanıcıya bildiriliyor.
 """
 
 import os
+import time
 import logging
 import statistics
 from collections import Counter
@@ -51,11 +62,52 @@ PERIOD_NAMES = ["4 Saatlik", "Günlük", "Haftalık", "Aylık", "6 Aylık", "Yı
 
 TR_TZ = ZoneInfo("Europe/Istanbul")
 
+# Stooq / Yahoo gibi siteler User-Agent'sız isteklerde daha kolay rate-limit
+# uyguluyor; gerçek bir tarayıcı gibi görünmek için ortak header seti.
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9,tr;q=0.8",
+}
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+# ----------------------------------------------------------------------------
+# BASİT BELLEK-İÇİ ÖNBELLEK (rate limit'i azaltmak için)
+# ----------------------------------------------------------------------------
+# Aynı (kaynak, sembol, interval, outputsize) kombinasyonu kısa süre içinde
+# tekrar istenirse ağa gitmek yerine önbellekten döner. Bu, tek bir sembol
+# sorgusunda 4 saatlik/günlük/haftalık gibi birden fazla çağrının Stooq/
+# yfinance'i art arda yormasını engeller.
+
+_CACHE: dict[str, tuple[float, object]] = {}
+_CACHE_TTL_SECONDS = 300  # 5 dakika
+
+
+def _cached_fetch(cache_key: str, fetch_fn):
+    now = time.time()
+    cached = _CACHE.get(cache_key)
+    if cached is not None:
+        ts, data = cached
+        if now - ts < _CACHE_TTL_SECONDS:
+            return data
+    data = fetch_fn()
+    _CACHE[cache_key] = (now, data)
+    return data
+
+
+def _is_rate_limit_text(text: str) -> bool:
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in [
+        "too many requests", "rate limit", "rate-limited", "429",
+    ])
 
 
 # ----------------------------------------------------------------------------
@@ -215,13 +267,15 @@ def fetch_bars_bist_index(user_symbol: str, interval: str, outputsize: int):
 # VERİ ÇEKME - YEDEK KAYNAK: Stooq (sadece Twelve Data başarısız olursa)
 # ----------------------------------------------------------------------------
 
-def fetch_bars_stooq(user_symbol: str, interval: str, outputsize: int):
+def _fetch_bars_stooq_uncached(user_symbol: str, interval: str, outputsize: int):
     """
     Yedek veri kaynağı. Sadece Twelve Data 'UPGRADE_REQUIRED' hatası
     verdiğinde (ücretsiz planda kapalı semboller için) çağrılır.
     Stooq'ta gün-içi (4 saatlik) veri YOKTUR, sadece günlük/haftalık.
     NOT: Stooq'un resmi API'si yoktur, bu basit CSV linkine dayanır;
-    bazı semboller (özellikle DXY) garantili çalışmayabilir.
+    bazı semboller (özellikle DXY) garantili çalışmayabilir. Ayrıca
+    User-Agent'sız isteklerde sıkça "Too Many Requests" ile rate limit
+    uygular; bu yüzden tarayıcı benzeri header'lar gönderiyoruz.
     """
     if interval == "4h":
         raise ValueError("Stooq kaynağında 4 saatlik veri yok.")
@@ -231,11 +285,18 @@ def fetch_bars_stooq(user_symbol: str, interval: str, outputsize: int):
     url = f"https://stooq.com/q/d/l/?s={symbol}&i={stooq_interval}"
 
     try:
-        resp = requests.get(url, timeout=15)
+        resp = requests.get(url, headers=BROWSER_HEADERS, timeout=15)
     except Exception as e:
         raise ValueError(f"Stooq'a bağlanılamadı: {e}")
 
     text = resp.text.strip()
+
+    if _is_rate_limit_text(text) or resp.status_code == 429:
+        raise ValueError(
+            "Stooq şu anda istek limiti uyguluyor (Too Many Requests). "
+            "Lütfen birkaç dakika sonra tekrar deneyin."
+        )
+
     lines_ = text.splitlines()
     if not lines_ or "Date" not in lines_[0]:
         preview = text[:200].replace("\n", " ")
@@ -265,6 +326,12 @@ def fetch_bars_stooq(user_symbol: str, interval: str, outputsize: int):
     return bars[-outputsize:] if len(bars) > outputsize else bars
 
 
+def fetch_bars_stooq(user_symbol: str, interval: str, outputsize: int):
+    """Stooq çağrısını kısa süreli önbellekle sarmalar (rate limit'i azaltmak için)."""
+    cache_key = f"stooq:{user_symbol.strip().upper()}:{interval}:{outputsize}"
+    return _cached_fetch(cache_key, lambda: _fetch_bars_stooq_uncached(user_symbol, interval, outputsize))
+
+
 # ----------------------------------------------------------------------------
 # VERİ ÇEKME - 2. YEDEK KAYNAK: Yahoo Finance (yfinance)
 # ----------------------------------------------------------------------------
@@ -282,6 +349,19 @@ YFINANCE_FUTURES_FALLBACK = {
     "XPDUSD": "PA=F",
 }
 
+# yfinance'in kendi Session'ı - tarayıcı benzeri header'larla, tekrar
+# tekrar yeni Session oluşturmamak için modül seviyesinde bir kez kurulur.
+_YFINANCE_SESSION = None
+
+
+def _get_yfinance_session():
+    global _YFINANCE_SESSION
+    if _YFINANCE_SESSION is None:
+        session = requests.Session()
+        session.headers.update(BROWSER_HEADERS)
+        _YFINANCE_SESSION = session
+    return _YFINANCE_SESSION
+
 
 def _normalize_yfinance_symbol(user_symbol: str) -> str:
     """'BTCUSD' -> 'BTC-USD', 'XAUUSD' -> 'XAUUSD=X' gibi Yahoo Finance formatına çevirir."""
@@ -293,8 +373,9 @@ def _normalize_yfinance_symbol(user_symbol: str) -> str:
     return f"{s}=X"
 
 
-def fetch_bars_yfinance(user_symbol: str, interval: str, outputsize: int):
-    """2. yedek veri kaynağı. Sadece Twelve Data VE Stooq başarısız olursa çağrılır."""
+def _fetch_bars_yfinance_uncached(user_symbol: str, interval: str, outputsize: int):
+    """2. yedek veri kaynağı. Sadece Twelve Data VE Stooq başarısız olursa çağrılır.
+    Yahoo da rate-limit uyguladığından basit bir retry/backoff eklendi."""
     if interval not in YFINANCE_INTERVAL_MAP:
         raise ValueError("yfinance kaynağında bu aralık (4 saatlik) desteklenmiyor.")
 
@@ -312,40 +393,62 @@ def fetch_bars_yfinance(user_symbol: str, interval: str, outputsize: int):
     days_multiplier = 7 if yf_interval == "1wk" else 2
     period_days = min(outputsize * days_multiplier + 30, 3650)
 
+    session = _get_yfinance_session()
+
     last_err = None
+    rate_limited = False
+    max_attempts = 3
+
     for candidate in candidates:
-        try:
-            df = yf.Ticker(candidate).history(
-                period=f"{period_days}d",
-                interval=yf_interval,
-                auto_adjust=False,
-            )
-            if df is None or df.empty:
-                last_err = ValueError(f"'{candidate}' için veri dönmedi.")
-                continue
+        for attempt in range(max_attempts):
+            try:
+                df = yf.Ticker(candidate, session=session).history(
+                    period=f"{period_days}d",
+                    interval=yf_interval,
+                    auto_adjust=False,
+                )
+                if df is None or df.empty:
+                    last_err = ValueError(f"'{candidate}' için veri dönmedi.")
+                    break  # boş veri retry ile düzelmez, sonraki adaya geç
 
-            bars = []
-            for idx, row in df.iterrows():
-                try:
-                    bars.append({
-                        "datetime": idx.strftime("%Y-%m-%d"),
-                        "high": float(row["High"]),
-                        "low": float(row["Low"]),
-                    })
-                except (TypeError, ValueError):
+                bars = []
+                for idx, row in df.iterrows():
+                    try:
+                        bars.append({
+                            "datetime": idx.strftime("%Y-%m-%d"),
+                            "high": float(row["High"]),
+                            "low": float(row["Low"]),
+                        })
+                    except (TypeError, ValueError):
+                        continue
+
+                if not bars:
+                    last_err = ValueError(f"'{candidate}' için ayrıştırılabilir veri yok.")
+                    break
+
+                return bars[-outputsize:] if len(bars) > outputsize else bars
+
+            except Exception as e:
+                last_err = e
+                if _is_rate_limit_text(str(e)):
+                    rate_limited = True
+                    # Basit üstel bekleme: 1.5s, 3s, 4.5s
+                    time.sleep(1.5 * (attempt + 1))
                     continue
+                break  # rate limit dışı bir hata ise tekrar denemenin anlamı yok
 
-            if not bars:
-                last_err = ValueError(f"'{candidate}' için ayrıştırılabilir veri yok.")
-                continue
-
-            return bars[-outputsize:] if len(bars) > outputsize else bars
-
-        except Exception as e:
-            last_err = e
-            continue
-
+    if rate_limited:
+        raise ValueError(
+            "Yahoo Finance şu anda istek limiti uyguluyor (Too Many Requests). "
+            "Lütfen birkaç dakika sonra tekrar deneyin."
+        )
     raise ValueError(f"yfinance: '{user_symbol}' için veri alınamadı ({last_err}).")
+
+
+def fetch_bars_yfinance(user_symbol: str, interval: str, outputsize: int):
+    """yfinance çağrısını kısa süreli önbellekle sarmalar (rate limit'i azaltmak için)."""
+    cache_key = f"yfinance:{user_symbol.strip().upper()}:{interval}:{outputsize}"
+    return _cached_fetch(cache_key, lambda: _fetch_bars_yfinance_uncached(user_symbol, interval, outputsize))
 
 
 # ----------------------------------------------------------------------------
