@@ -26,6 +26,11 @@ try:
 except ImportError:
     isyatirimhisse = None
 
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None
+
 # ----------------------------------------------------------------------------
 # AYARLAR
 # ----------------------------------------------------------------------------
@@ -108,7 +113,10 @@ def fetch_bars_twelvedata(user_symbol: str, interval: str, outputsize: int):
         msg = data.get("message", "")
         # "plan" / "Grow" / "Venture" / "available starting" geçiyorsa
         # -> bu sembol ücretsiz planda kapalı, yedek kaynağa geçilecek
-        if any(word in msg.lower() for word in ["plan", "grow", "venture", "available starting"]):
+        if any(word in msg.lower() for word in [
+            "plan", "grow", "venture", "available starting",
+            "not found", "no data", "invalid symbol", "does not exist",
+        ]):
             raise ValueError("UPGRADE_REQUIRED")
         raise ValueError(msg)
 
@@ -230,7 +238,12 @@ def fetch_bars_stooq(user_symbol: str, interval: str, outputsize: int):
     text = resp.text.strip()
     lines_ = text.splitlines()
     if not lines_ or "Date" not in lines_[0]:
-        raise ValueError(f"Stooq: '{user_symbol}' için veri alınamadı (sembol bulunamadı olabilir).")
+        preview = text[:200].replace("\n", " ")
+        raise ValueError(
+            f"Stooq: '{user_symbol}' için veri alınamadı "
+            f"(sembol desteklenmiyor ya da günlük istek limiti dolmuş olabilir. "
+            f"Dönen içerik: {preview!r})"
+        )
 
     bars = []
     for line in lines_[1:]:
@@ -250,6 +263,89 @@ def fetch_bars_stooq(user_symbol: str, interval: str, outputsize: int):
         raise ValueError(f"Stooq: '{user_symbol}' için ayrıştırılabilir veri bulunamadı.")
 
     return bars[-outputsize:] if len(bars) > outputsize else bars
+
+
+# ----------------------------------------------------------------------------
+# VERİ ÇEKME - 2. YEDEK KAYNAK: Yahoo Finance (yfinance)
+# ----------------------------------------------------------------------------
+# Sadece Twelve Data VE Stooq ikisi de başarısız olursa denenir.
+# yfinance'te gün-içi (4 saatlik) veri bu botun ihtiyacına uygun şekilde
+# YOKTUR (destekli değildir), sadece günlük/haftalık.
+
+YFINANCE_INTERVAL_MAP = {"1day": "1d", "1week": "1wk"}
+
+# Platin/paladyum Yahoo'da forex çifti (XPTUSD=X / XPDUSD=X) olarak
+# çalışmayabilir; başarısız olursa sürekli vadeli işlem kontratına
+# (spota çok yakın hareket eder) düşülür.
+YFINANCE_FUTURES_FALLBACK = {
+    "XPTUSD": "PL=F",
+    "XPDUSD": "PA=F",
+}
+
+
+def _normalize_yfinance_symbol(user_symbol: str) -> str:
+    """'BTCUSD' -> 'BTC-USD', 'XAUUSD' -> 'XAUUSD=X' gibi Yahoo Finance formatına çevirir."""
+    s = user_symbol.strip().upper().replace(" ", "").replace("/", "")
+    if len(s) > 3:
+        base, quote = s[:-3], s[-3:]
+        if base in CRYPTO_BASES:
+            return f"{base}-{quote}"
+    return f"{s}=X"
+
+
+def fetch_bars_yfinance(user_symbol: str, interval: str, outputsize: int):
+    """2. yedek veri kaynağı. Sadece Twelve Data VE Stooq başarısız olursa çağrılır."""
+    if interval not in YFINANCE_INTERVAL_MAP:
+        raise ValueError("yfinance kaynağında bu aralık (4 saatlik) desteklenmiyor.")
+
+    if yf is None:
+        raise ValueError("yfinance kütüphanesi kurulu değil (pip install yfinance).")
+
+    yf_interval = YFINANCE_INTERVAL_MAP[interval]
+    normalized_input = user_symbol.strip().upper().replace(" ", "")
+
+    candidates = [_normalize_yfinance_symbol(user_symbol)]
+    if normalized_input in YFINANCE_FUTURES_FALLBACK:
+        candidates.append(YFINANCE_FUTURES_FALLBACK[normalized_input])
+
+    # outputsize'ın üstüne, hafta sonu/tatil kayıplarını telafi etmek için pay bırakılır.
+    days_multiplier = 7 if yf_interval == "1wk" else 2
+    period_days = min(outputsize * days_multiplier + 30, 3650)
+
+    last_err = None
+    for candidate in candidates:
+        try:
+            df = yf.Ticker(candidate).history(
+                period=f"{period_days}d",
+                interval=yf_interval,
+                auto_adjust=False,
+            )
+            if df is None or df.empty:
+                last_err = ValueError(f"'{candidate}' için veri dönmedi.")
+                continue
+
+            bars = []
+            for idx, row in df.iterrows():
+                try:
+                    bars.append({
+                        "datetime": idx.strftime("%Y-%m-%d"),
+                        "high": float(row["High"]),
+                        "low": float(row["Low"]),
+                    })
+                except (TypeError, ValueError):
+                    continue
+
+            if not bars:
+                last_err = ValueError(f"'{candidate}' için ayrıştırılabilir veri yok.")
+                continue
+
+            return bars[-outputsize:] if len(bars) > outputsize else bars
+
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise ValueError(f"yfinance: '{user_symbol}' için veri alınamadı ({last_err}).")
 
 
 # ----------------------------------------------------------------------------
@@ -304,9 +400,14 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
             try:
                 return fetch_bars_stooq(user_symbol, interval, outputsize)
             except Exception as stooq_err:
-                raise ValueError(
-                    f"Twelve Data ücretsiz planda kapalı; Stooq denemesi de başarısız oldu: {stooq_err}"
-                )
+                logger.info(f"🔄 '{user_symbol}' Stooq da başarısız oldu, yfinance deneniyor... ({stooq_err})")
+                try:
+                    return fetch_bars_yfinance(user_symbol, interval, outputsize)
+                except Exception as yf_err:
+                    raise ValueError(
+                        f"Twelve Data ücretsiz planda kapalı; Stooq ({stooq_err}) ve "
+                        f"yfinance ({yf_err}) denemeleri de başarısız oldu."
+                    )
         raise
 
 
@@ -404,8 +505,15 @@ def _levels_from_bars(bars, birim: str = "gün") -> dict:
 
     values = []
     for bar in bars:
-        values.append(round(float(bar["high"]), 4))
-        values.append(round(float(bar["low"]), 4))
+        h = round(float(bar["high"]), 4)
+        l = round(float(bar["low"]), 4)
+        values.append(h)
+        # high == low ise (ör. BIST endekslerinde gerçek yüksek/düşük veri
+        # olmadığı için ikisi de kapanışa eşitleniyor), aynı değeri iki kez
+        # eklemek o barı yapay olarak "tekrarlayan seviye" (mod) yapar.
+        # Bu yüzden eşitse sadece bir kez sayıyoruz.
+        if l != h:
+            values.append(l)
 
     denge = statistics.median(values)
     ortalama = statistics.mean(values)
