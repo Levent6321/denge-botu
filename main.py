@@ -341,12 +341,14 @@ def fetch_bars_stooq(user_symbol: str, interval: str, outputsize: int):
 
 YFINANCE_INTERVAL_MAP = {"1day": "1d", "1week": "1wk"}
 
-# Platin/paladyum Yahoo'da forex çifti (XPTUSD=X / XPDUSD=X) olarak
-# çalışmayabilir; başarısız olursa sürekli vadeli işlem kontratına
-# (spota çok yakın hareket eder) düşülür.
+# Bazı metal/emtia sembolleri Yahoo'da forex çifti (ör. XAGUSD=X) olarak
+# çalışmıyor veya yfinance'te tuhaf iç hatalara (ör. NoneType) yol açıyor;
+# bu yüzden bu sembollerde doğrudan en yakın vadeli işlem kontratına düşülür
+# (spota çok yakın hareket eder).
 YFINANCE_FUTURES_FALLBACK = {
-    "XPTUSD": "PL=F",
-    "XPDUSD": "PA=F",
+    "XAGUSD": "SI=F",   # Gümüş vadeli
+    "XPTUSD": "PL=F",   # Platin vadeli
+    "XPDUSD": "PA=F",   # Paladyum vadeli
 }
 
 # yfinance'in kendi Session'ı - tarayıcı benzeri header'larla, tekrar
