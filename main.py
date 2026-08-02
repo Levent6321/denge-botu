@@ -29,18 +29,17 @@ GÜNCELLEME NOTU (4. revizyon - yfinance "Too Many Requests" düzeltmesi):
     bot-engelleme (429 Too Many Requests) uyguluyor. Bu, XAGUSD gibi 3
     kaynağı da olan sembollerde bile SON çare olan yfinance'in tamamen
     başarısız olmasına yol açabiliyor.
-  - Çözüm: mümkünse `curl_cffi` kütüphanesi ile gerçek bir Chrome
-    tarayıcısının TLS parmak izini taklit eden bir oturum (session)
-    oluşturup yfinance'e veriyoruz. Bu, yfinance'in kendi resmi önerdiği
-    çözüm ve engellemeyi büyük ölçüde azaltıyor. Kurulum:
-        pip install curl_cffi
-    Kurulu değilse kod sessizce eski davranışa (varsayılan oturum) geri
-    döner; hiçbir şey kırılmaz, sadece rate-limit koruması olmaz.
-  - Retry/backoff de güçlendirildi: deneme sayısı 3'ten 4'e çıkarıldı,
-    bekleme süresine jitter (rastgele ek gecikme) eklendi ki art arda
-    gelen istekler Yahoo'ya aynı anda toslamasın.
-  - Önbellek (yfinance) TTL'i 15 dk'dan 30 dk'ya çıkarıldı; bu da aynı
-    sembol için kısa sürede tekrar tekrar Yahoo'ya gidilmesini azaltır.
+  - DENENDİ VE GERİ ALINDI: `curl_cffi` ile tarayıcı-taklitli oturum
+    denendi, ancak yfinance'in çerez/crumb işleme kodunda ÇÖZÜLMEMİŞ,
+    bilinen bir hataya yol açtığı görüldü ("'str' object has no
+    attribute 'name'" - bkz. yfinance GitHub issue #2429, #2461, #2470,
+    #2494, #2684). Bu yüzden curl_cffi entegrasyonu KALDIRILDI; yfinance
+    yine kendi varsayılan (curl_cffi'siz) oturum yönetimini kullanıyor.
+  - Bunun yerine sadece güvenli/yan etkisiz iyileştirmeler korunuyor:
+    retry deneme sayısı 3'ten 4'e çıkarıldı, bekleme süresine jitter
+    (rastgele ek gecikme) eklendi, önbellek (yfinance) TTL'i 15 dk'dan
+    30 dk'ya çıkarıldı. Kalıcı "Too Many Requests" durumunda tek gerçek
+    çözüm birkaç dakika beklemek veya sunucunun IP'sini değiştirmektir.
 """
 
 import os
@@ -56,11 +55,6 @@ import requests
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-
-try:
-    from curl_cffi import requests as curl_requests
-except ImportError:
-    curl_requests = None
 
 try:
     import isyatirimhisse
@@ -422,32 +416,12 @@ YFINANCE_FUTURES_FALLBACK = {
     "XPDUSD": "PA=F",   # Paladyum vadeli
 }
 
-# NOT: yfinance'e dışarıdan SADE bir requests.Session (düz Python
-# `requests` kütüphanesiyle) vermek, kütüphanenin kendi iç kimlik
-# doğrulama (crumb/cookie) mekanizmasını devre dışı bırakıp TÜM istekleri
-# "Too Many Requests" gibi görünen kalıcı bir hataya sokabiliyor.
-#
-# Bunun yerine, mümkünse `curl_cffi` ile gerçek bir Chrome tarayıcısının
-# TLS parmak izini taklit eden bir oturum kullanıyoruz — bu, Yahoo'nun
-# bulut/veri merkezi IP'lerine karşı uyguladığı bot-engellemeyi büyük
-# ölçüde azaltıyor (yfinance projesinin resmi önerdiği çözüm budur).
-# curl_cffi kurulu değilse session=None döner ve yfinance kendi
-# varsayılan davranışına (eski durum) geri düşer.
-_YF_SESSION = None
-if curl_requests is not None:
-    try:
-        _YF_SESSION = curl_requests.Session(impersonate="chrome")
-    except Exception:
-        _YF_SESSION = None
-
-
-def _make_yf_ticker(candidate: str):
-    if _YF_SESSION is not None:
-        try:
-            return yf.Ticker(candidate, session=_YF_SESSION)
-        except Exception:
-            pass
-    return yf.Ticker(candidate)
+# NOT: yfinance'e dışarıdan özel bir requests.Session (ister düz
+# `requests`, ister `curl_cffi` ile) vermek denendi; ancak curl_cffi
+# session'ı yfinance'in çerez/crumb işleme kodunda ÇÖZÜLMEMİŞ, bilinen
+# bir hataya yol açıyor ("'str' object has no attribute 'name'").
+# Bu yüzden burada session'ı KASITLI OLARAK yfinance'in kendi varsayılan
+# yönetimine bırakıyoruz (session parametresi vermiyoruz).
 
 
 def _normalize_yfinance_symbol(user_symbol: str) -> str:
@@ -490,13 +464,12 @@ def _yfinance_candidates(user_symbol: str) -> list:
 
 def _yf_history_with_retry(candidate: str, period: str, interval: str):
     """yfinance.Ticker(...).history çağrısını rate-limit için retry/backoff
-    ile sarmalar (mümkünse curl_cffi tabanlı tarayıcı-taklitli oturumla).
-    Boş veri veya rate-limit dışı hatalarda hemen None/istisna döner
-    (retry ile düzelmez)."""
+    ile sarmalar. Boş veri veya rate-limit dışı hatalarda hemen
+    None/istisna döner (retry ile düzelmez)."""
     last_err = None
     for attempt in range(4):
         try:
-            df = _make_yf_ticker(candidate).history(period=period, interval=interval, auto_adjust=False)
+            df = yf.Ticker(candidate).history(period=period, interval=interval, auto_adjust=False)
             if df is None or df.empty:
                 return None, ValueError(f"'{candidate}' için veri dönmedi.")
             return df, None
