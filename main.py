@@ -3,20 +3,22 @@ DENGE ARALIĞI TELEGRAM BOTU (3 Kaynaklı Hibrit Model)
 ============================================================================
 1) Twelve Data      -> BTCUSD, XAUUSD, EURUSD gibi standart forex/kripto/emtia
 2) isyatirimhisse    -> XU100, XU030, XU500 gibi BIST endeksleri (İş Yatırım)
-3) Stooq (yedek)     -> Twelve Data'da ücretsiz planda kapalı olan XAGUSD,
-                        XPTUSD, XPDUSD, VIX, DXY gibi semboller için denenir
-                        (garantisi yoktur, Twelve Data reddederse devreye girer)
+3) MetalpriceAPI / yfinance (yedek) -> Twelve Data'da ücretsiz planda kapalı
+                        olan XAGUSD, XPTUSD, XPDUSD, VIX, DXY gibi semboller
+                        için denenir (garantisi yoktur).
 XAUTRYG (Gram Altın/TL) ise XAUUSD ve USDTRY üzerinden TÜRETİLİR.
 
-GÜNCELLEME NOTU: Stooq ve yfinance sık sık "Too Many Requests" (rate limit)
-hatası verdiği için şu iyileştirmeler eklendi:
-  - Her iki kaynağa da gerçek tarayıcı User-Agent'ı ile istek atılıyor.
-  - yfinance isteklerinde basit retry/backoff var.
-  - Sonuçlar kısa süreli (5 dk) bellek-içi önbellekte tutuluyor, böylece
-    aynı sembol için art arda gelen istekler (4 saatlik/günlük/haftalık/
-    aylık) gereksiz yere kaynağı tekrar tekrar yormuyor.
-  - "Too many requests / rate limit" durumu ayrı ve daha anlaşılır bir
-    hata mesajıyla kullanıcıya bildiriliyor.
+GÜNCELLEME NOTU (2. revizyon):
+  - Stooq, sık "Too Many Requests" hatası verdiği ve XAG/XPT/XPD gibi
+    semboller için genelde başarısız olduğu için yedek zincirinden
+    ÇIKARILDI. Artık sıralama: Twelve Data -> MetalpriceAPI (varsa) ->
+    yfinance.
+  - yfinance artık "4 Saatlik" (4h) aralığını da destekliyor: doğrudan
+    4 saatlik veri sağlamadığı için 60 dakikalık barlar çekilip pandas ile
+    4 saatlik OHLC'ye yeniden örnekleniyor (resample). Bu sayede
+    XAGUSD/XPTUSD/XPDUSD gibi Twelve Data'da kapalı sembollerde de
+    "4 Saatlik" bloğu artık hesaplanabiliyor (önceden hep hata veriyordu).
+  - Önceki notlar (User-Agent, retry/backoff, 5-15 dk önbellek) korunuyor.
 """
 
 import os
@@ -41,6 +43,11 @@ try:
     import yfinance as yf
 except ImportError:
     yf = None
+
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
 
 # ----------------------------------------------------------------------------
 # AYARLAR
@@ -67,7 +74,7 @@ PERIOD_NAMES = ["4 Saatlik", "Günlük", "Haftalık", "Aylık", "6 Aylık", "Yı
 
 TR_TZ = ZoneInfo("Europe/Istanbul")
 
-# Stooq / Yahoo gibi siteler User-Agent'sız isteklerde daha kolay rate-limit
+# Yahoo gibi siteler User-Agent'sız isteklerde daha kolay rate-limit
 # uyguluyor; gerçek bir tarayıcı gibi görünmek için ortak header seti.
 BROWSER_HEADERS = {
     "User-Agent": (
@@ -87,13 +94,8 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------------------------------
 # BASİT BELLEK-İÇİ ÖNBELLEK (rate limit'i azaltmak için)
 # ----------------------------------------------------------------------------
-# Aynı (kaynak, sembol, interval, outputsize) kombinasyonu kısa süre içinde
-# tekrar istenirse ağa gitmek yerine önbellekten döner. Bu, tek bir sembol
-# sorgusunda 4 saatlik/günlük/haftalık gibi birden fazla çağrının Stooq/
-# yfinance'i art arda yormasını engeller.
-
 _CACHE: dict[str, tuple[float, object]] = {}
-_CACHE_TTL_SECONDS = 900  # 15 dakika (Yahoo/Stooq rate-limit riskini azaltmak için)
+_CACHE_TTL_SECONDS = 900  # 15 dakika (Yahoo rate-limit riskini azaltmak için)
 
 
 def _cached_fetch(cache_key: str, fetch_fn):
@@ -130,22 +132,6 @@ def normalize_symbol(user_symbol: str) -> str:
     return s
 
 
-def _normalize_stooq_symbol(user_symbol: str) -> str:
-    """Kullanıcı girdisini Stooq formatına çevirir (yedek kaynak için)."""
-    s = user_symbol.strip().upper().replace(" ", "")
-
-    # VIX özel durumu (endeksler Stooq'ta '^' öneki alır)
-    if s in ("VIX", "VIXUSD"):
-        return "^vix"
-
-    # DXY: Stooq'ta net teyit edilemedi, en olası tahmin denenir
-    if s in ("DXY", "DXYUSD"):
-        return "usdx"
-
-    # Forex/emtia genel formatı: küçük harf, ayraçsız (xauusd, xagusd, xptusd, xpdusd vb.)
-    return s.replace("/", "").lower()
-
-
 # ----------------------------------------------------------------------------
 # VERİ ÇEKME - ANA KAYNAK: Twelve Data
 # ----------------------------------------------------------------------------
@@ -168,8 +154,6 @@ def fetch_bars_twelvedata(user_symbol: str, interval: str, outputsize: int):
 
     if isinstance(data, dict) and data.get("status") == "error":
         msg = data.get("message", "")
-        # "plan" / "Grow" / "Venture" / "available starting" geçiyorsa
-        # -> bu sembol ücretsiz planda kapalı, yedek kaynağa geçilecek
         if any(word in msg.lower() for word in [
             "plan", "grow", "venture", "available starting",
             "not found", "no data", "invalid symbol", "does not exist",
@@ -187,8 +171,6 @@ def fetch_bars_twelvedata(user_symbol: str, interval: str, outputsize: int):
 # VERİ ÇEKME - BIST ENDEKSLERİ: isyatirimhisse (İş Yatırım)
 # ----------------------------------------------------------------------------
 
-# XU100/XU030/XU500 gibi BIST endeksleri Twelve Data'da hiç bulunmuyor.
-# Bunlar için doğrudan İş Yatırım'ın verisi (isyatirimhisse) kullanılır.
 BIST_INDEX_ALIASES = {
     "XU100": "XU100", "BIST100": "XU100",
     "XU030": "XU030", "XU30": "XU030", "BIST30": "XU030",
@@ -197,26 +179,22 @@ BIST_INDEX_ALIASES = {
 
 
 def _normalize_date_str(raw) -> str:
-    """isyatirimhisse'den gelen tarihi 'YYYY-MM-DD' formatına çevirir
-    (kaynak GG-AA-YYYY, GG.AA.YYYY ya da zaten ISO olabilir)."""
     raw = str(raw).strip()
     if len(raw) >= 10 and raw[4] == "-" and raw[7] == "-":
         return raw[:10]
     for sep in ("-", ".", "/"):
         parts = raw.split(sep)
         if len(parts) == 3:
-            if len(parts[2]) == 4:  # GG-AA-YYYY
+            if len(parts[2]) == 4:
                 gg, aa, yyyy = parts
                 return f"{yyyy}-{aa.zfill(2)}-{gg.zfill(2)}"
-            if len(parts[0]) == 4:  # YYYY-AA-GG
+            if len(parts[0]) == 4:
                 yyyy, aa, gg = parts
                 return f"{yyyy}-{aa.zfill(2)}-{gg.zfill(2)}"
     raise ValueError(f"Tarih formatı tanınamadı: {raw}")
 
 
 def fetch_bars_bist_index(user_symbol: str, interval: str, outputsize: int):
-    """BIST endeksleri (XU100/XU030/XU500) için İş Yatırım'dan veri çeker.
-    Bu kaynakta gün-içi (4 saatlik) veri YOKTUR."""
     if interval == "4h":
         raise ValueError("İş Yatırım kaynağında 4 saatlik veri yok.")
 
@@ -226,7 +204,7 @@ def fetch_bars_bist_index(user_symbol: str, interval: str, outputsize: int):
     index_code = BIST_INDEX_ALIASES[user_symbol.strip().upper().replace(" ", "")]
 
     today = datetime.now(TR_TZ).date()
-    start = today - timedelta(days=800)  # ~2.2 yıl geriye, yıllık ihtiyacı karşılar
+    start = today - timedelta(days=800)
 
     df = isyatirimhisse.fetch_index_data(
         indices=index_code,
@@ -274,20 +252,11 @@ def fetch_bars_bist_index(user_symbol: str, interval: str, outputsize: int):
 
 
 # ----------------------------------------------------------------------------
-# VERİ ÇEKME - YEDEK KAYNAK: MetalpriceAPI (sadece XAG/XPT/XPD için, Twelve
-# Data kapalıysa Stooq/Yahoo'dan ÖNCE denenir)
+# VERİ ÇEKME - YEDEK KAYNAK: MetalpriceAPI (sadece XAG/XPT/XPD için)
 # ----------------------------------------------------------------------------
-# metalpriceapi.com, API key ile çalışan gerçek bir servistir (scraping
-# değildir), bu yüzden Stooq/Yahoo'nun yaşadığı "bot sanılıp engellenme"
-# riski yoktur. Ücretsiz planda ayda 100 istek hakkı var; bu yüzden burada
-# tek bir "timeframe" isteğiyle (365 güne kadar) hem günlük hem haftalık
-# ihtiyacı karşılıyoruz (haftalık barlar günlük veriden yerel olarak
-# toplanıyor), kotayı en verimli şekilde kullanmak için.
 
 METALPRICEAPI_URL = "https://api.metalpriceapi.com/v1/timeframe"
 
-# Bu bot sadece Twelve Data'da kapalı olan metaller için MetalpriceAPI'yi
-# dener; DXY/VIX gibi metal olmayan semboller için bu kaynak atlanır.
 METALPRICEAPI_SYMBOL_MAP = {
     "XAGUSD": "XAG",  # Gümüş
     "XPTUSD": "XPT",  # Platin
@@ -307,13 +276,11 @@ def _fetch_bars_metalpriceapi_uncached(user_symbol: str, interval: str, outputsi
         raise ValueError(f"MetalpriceAPI '{user_symbol}' sembolünü desteklemiyor.")
 
     today = datetime.now(TR_TZ).date()
-    # 365 gün, API'nin timeframe endpoint'indeki maksimum aralık.
     if interval == "1week":
         days_needed = min(outputsize * 7 + 14, 365)
     else:
         days_needed = min(outputsize + 14, 365)
     start_date = today - timedelta(days=days_needed)
-    # Free planda güncel günün verisi henüz gelmemiş olabilir (bir gün gecikmeli).
     end_date = today - timedelta(days=1)
 
     params = {
@@ -341,9 +308,6 @@ def _fetch_bars_metalpriceapi_uncached(user_symbol: str, interval: str, outputsi
         if price is None:
             continue
         price = float(price)
-        # Bu kaynak sadece tek bir günlük fiyat verir (OHLC değil); high/low
-        # olarak aynı değeri kullanıyoruz (BIST endeksleri için de aynı
-        # yaklaşım zaten uygulanıyor).
         daily_bars.append({"datetime": date_str, "high": price, "low": price, "close": price})
 
     if not daily_bars:
@@ -357,96 +321,20 @@ def _fetch_bars_metalpriceapi_uncached(user_symbol: str, interval: str, outputsi
 
 
 def fetch_bars_metalpriceapi(user_symbol: str, interval: str, outputsize: int):
-    """MetalpriceAPI çağrısını önbellekle sarmalar (100 istek/ay kotasını korumak için)."""
     cache_key = f"metalpriceapi:{user_symbol.strip().upper()}:{interval}:{outputsize}"
     return _cached_fetch(cache_key, lambda: _fetch_bars_metalpriceapi_uncached(user_symbol, interval, outputsize))
 
 
 # ----------------------------------------------------------------------------
-# VERİ ÇEKME - YEDEK KAYNAK: Stooq (MetalpriceAPI de başarısız/uygun değilse)
-# ----------------------------------------------------------------------------
-
-def _fetch_bars_stooq_uncached(user_symbol: str, interval: str, outputsize: int):
-    """
-    Yedek veri kaynağı. Sadece Twelve Data 'UPGRADE_REQUIRED' hatası
-    verdiğinde (ücretsiz planda kapalı semboller için) çağrılır.
-    Stooq'ta gün-içi (4 saatlik) veri YOKTUR, sadece günlük/haftalık.
-    NOT: Stooq'un resmi API'si yoktur, bu basit CSV linkine dayanır;
-    bazı semboller (özellikle DXY) garantili çalışmayabilir. Ayrıca
-    User-Agent'sız isteklerde sıkça "Too Many Requests" ile rate limit
-    uygular; bu yüzden tarayıcı benzeri header'lar gönderiyoruz.
-    """
-    if interval == "4h":
-        raise ValueError("Stooq kaynağında 4 saatlik veri yok.")
-
-    stooq_interval = "w" if interval == "1week" else "d"
-    symbol = _normalize_stooq_symbol(user_symbol)
-    url = f"https://stooq.com/q/d/l/?s={symbol}&i={stooq_interval}"
-
-    try:
-        resp = requests.get(url, headers=BROWSER_HEADERS, timeout=15)
-    except Exception as e:
-        raise ValueError(f"Stooq'a bağlanılamadı: {e}")
-
-    text = resp.text.strip()
-
-    if _is_rate_limit_text(text) or resp.status_code == 429:
-        raise ValueError(
-            "Stooq şu anda istek limiti uyguluyor (Too Many Requests). "
-            "Lütfen birkaç dakika sonra tekrar deneyin."
-        )
-
-    lines_ = text.splitlines()
-    if not lines_ or "Date" not in lines_[0]:
-        preview = text[:200].replace("\n", " ")
-        raise ValueError(
-            f"Stooq: '{user_symbol}' için veri alınamadı "
-            f"(sembol desteklenmiyor ya da günlük istek limiti dolmuş olabilir. "
-            f"Dönen içerik: {preview!r})"
-        )
-
-    bars = []
-    for line in lines_[1:]:
-        parts = line.split(",")
-        if len(parts) < 5:
-            continue
-        try:
-            bar = {
-                "datetime": parts[0],
-                "high": float(parts[2]),
-                "low": float(parts[3]),
-            }
-            if len(parts) > 4 and parts[4]:
-                bar["close"] = float(parts[4])
-            bars.append(bar)
-        except ValueError:
-            continue
-
-    if not bars:
-        raise ValueError(f"Stooq: '{user_symbol}' için ayrıştırılabilir veri bulunamadı.")
-
-    return bars[-outputsize:] if len(bars) > outputsize else bars
-
-
-def fetch_bars_stooq(user_symbol: str, interval: str, outputsize: int):
-    """Stooq çağrısını kısa süreli önbellekle sarmalar (rate limit'i azaltmak için)."""
-    cache_key = f"stooq:{user_symbol.strip().upper()}:{interval}:{outputsize}"
-    return _cached_fetch(cache_key, lambda: _fetch_bars_stooq_uncached(user_symbol, interval, outputsize))
-
-
-# ----------------------------------------------------------------------------
 # VERİ ÇEKME - 2. YEDEK KAYNAK: Yahoo Finance (yfinance)
 # ----------------------------------------------------------------------------
-# Sadece Twelve Data VE Stooq ikisi de başarısız olursa denenir.
-# yfinance'te gün-içi (4 saatlik) veri bu botun ihtiyacına uygun şekilde
-# YOKTUR (destekli değildir), sadece günlük/haftalık.
+# Twelve Data (ve varsa MetalpriceAPI) başarısız olursa denenir.
+# Günlük/Haftalık için doğrudan yfinance verisi kullanılır.
+# 4 Saatlik için yfinance'te native "4h" aralığı YOK; bu yüzden 60 dakikalık
+# barlar çekilip pandas ile 4 saatlik OHLC'ye yeniden örnekleniyor.
 
 YFINANCE_INTERVAL_MAP = {"1day": "1d", "1week": "1wk"}
 
-# Bazı metal/emtia sembolleri Yahoo'da forex çifti (ör. XAGUSD=X) olarak
-# çalışmıyor veya yfinance'te tuhaf iç hatalara (ör. NoneType) yol açıyor;
-# bu yüzden bu sembollerde doğrudan en yakın vadeli işlem kontratına düşülür
-# (spota çok yakın hareket eder).
 YFINANCE_FUTURES_FALLBACK = {
     "XAGUSD": "SI=F",   # Gümüş vadeli
     "XPTUSD": "PL=F",   # Platin vadeli
@@ -470,68 +358,75 @@ def _normalize_yfinance_symbol(user_symbol: str) -> str:
     return f"{s}=X"
 
 
-def _fetch_bars_yfinance_uncached(user_symbol: str, interval: str, outputsize: int):
-    """2. yedek veri kaynağı. Sadece Twelve Data VE Stooq başarısız olursa çağrılır.
-    Yahoo da rate-limit uyguladığından basit bir retry/backoff eklendi."""
-    if interval not in YFINANCE_INTERVAL_MAP:
-        raise ValueError("yfinance kaynağında bu aralık (4 saatlik) desteklenmiyor.")
-
-    if yf is None:
-        raise ValueError("yfinance kütüphanesi kurulu değil (pip install yfinance).")
-
-    yf_interval = YFINANCE_INTERVAL_MAP[interval]
+def _yfinance_candidates(user_symbol: str) -> list:
     normalized_input = user_symbol.strip().upper().replace(" ", "")
-
     candidates = [_normalize_yfinance_symbol(user_symbol)]
     if normalized_input in YFINANCE_FUTURES_FALLBACK:
         candidates.append(YFINANCE_FUTURES_FALLBACK[normalized_input])
+    return candidates
 
-    # outputsize'ın üstüne, hafta sonu/tatil kayıplarını telafi etmek için pay bırakılır.
+
+def _yf_history_with_retry(candidate: str, period: str, interval: str):
+    """yfinance.Ticker(...).history çağrısını rate-limit için basit
+    retry/backoff ile sarmalar. Boş veri veya rate-limit dışı hatalarda
+    hemen None/istisna döner (retry ile düzelmez)."""
+    last_err = None
+    for attempt in range(3):
+        try:
+            df = yf.Ticker(candidate).history(period=period, interval=interval, auto_adjust=False)
+            if df is None or df.empty:
+                return None, ValueError(f"'{candidate}' için veri dönmedi.")
+            return df, None
+        except Exception as e:
+            last_err = e
+            if _is_rate_limit_text(str(e)):
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            break
+    return None, last_err
+
+
+def _fetch_bars_yfinance_uncached(user_symbol: str, interval: str, outputsize: int):
+    if yf is None:
+        raise ValueError("yfinance kütüphanesi kurulu değil (pip install yfinance).")
+
+    if interval == "4h":
+        return _fetch_4h_bars_yfinance(user_symbol, outputsize)
+
+    if interval not in YFINANCE_INTERVAL_MAP:
+        raise ValueError(f"yfinance kaynağında '{interval}' aralığı desteklenmiyor.")
+
+    yf_interval = YFINANCE_INTERVAL_MAP[interval]
+    candidates = _yfinance_candidates(user_symbol)
+
     days_multiplier = 7 if yf_interval == "1wk" else 2
     period_days = min(outputsize * days_multiplier + 30, 3650)
 
     last_err = None
     rate_limited = False
-    max_attempts = 3
-
     for candidate in candidates:
-        for attempt in range(max_attempts):
+        df, err = _yf_history_with_retry(candidate, f"{period_days}d", yf_interval)
+        if err is not None:
+            last_err = err
+            if _is_rate_limit_text(str(err)):
+                rate_limited = True
+            continue
+
+        bars = []
+        for idx, row in df.iterrows():
             try:
-                df = yf.Ticker(candidate).history(
-                    period=f"{period_days}d",
-                    interval=yf_interval,
-                    auto_adjust=False,
-                )
-                if df is None or df.empty:
-                    last_err = ValueError(f"'{candidate}' için veri dönmedi.")
-                    break  # boş veri retry ile düzelmez, sonraki adaya geç
+                bars.append({
+                    "datetime": idx.strftime("%Y-%m-%d"),
+                    "high": float(row["High"]),
+                    "low": float(row["Low"]),
+                    "close": float(row["Close"]),
+                })
+            except (TypeError, ValueError):
+                continue
 
-                bars = []
-                for idx, row in df.iterrows():
-                    try:
-                        bars.append({
-                            "datetime": idx.strftime("%Y-%m-%d"),
-                            "high": float(row["High"]),
-                            "low": float(row["Low"]),
-                            "close": float(row["Close"]),
-                        })
-                    except (TypeError, ValueError):
-                        continue
-
-                if not bars:
-                    last_err = ValueError(f"'{candidate}' için ayrıştırılabilir veri yok.")
-                    break
-
-                return bars[-outputsize:] if len(bars) > outputsize else bars
-
-            except Exception as e:
-                last_err = e
-                if _is_rate_limit_text(str(e)):
-                    rate_limited = True
-                    # Basit üstel bekleme: 1.5s, 3s, 4.5s
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                break  # rate limit dışı bir hata ise tekrar denemenin anlamı yok
+        if bars:
+            return bars[-outputsize:] if len(bars) > outputsize else bars
+        last_err = ValueError(f"'{candidate}' için ayrıştırılabilir veri yok.")
 
     if rate_limited:
         raise ValueError(
@@ -539,6 +434,61 @@ def _fetch_bars_yfinance_uncached(user_symbol: str, interval: str, outputsize: i
             "Lütfen birkaç dakika sonra tekrar deneyin."
         )
     raise ValueError(f"yfinance: '{user_symbol}' için veri alınamadı ({last_err}).")
+
+
+def _fetch_4h_bars_yfinance(user_symbol: str, outputsize: int):
+    """yfinance'te native 4 saatlik interval olmadığı için 60 dakikalık
+    barlar çekilip 4 saatlik OHLC'ye yeniden örnekleniyor (resample).
+    yfinance 60m veriyi en fazla ~730 gün geriye sunar; bu botun ihtiyacı
+    (son birkaç 4 saatlik mum) için fazlasıyla yeterli, bu yüzden kısa bir
+    period (ör. 10 gün) yeterli."""
+    if pd is None:
+        raise ValueError("pandas kurulu değil, 4 saatlik yeniden örnekleme (resample) yapılamıyor.")
+
+    candidates = _yfinance_candidates(user_symbol)
+
+    last_err = None
+    rate_limited = False
+    for candidate in candidates:
+        df, err = _yf_history_with_retry(candidate, "10d", "60m")
+        if err is not None:
+            last_err = err
+            if _is_rate_limit_text(str(err)):
+                rate_limited = True
+            continue
+
+        try:
+            resampled = df.resample("4h", label="right", closed="right").agg({
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+            }).dropna(how="all")
+        except Exception as e:
+            last_err = ValueError(f"'{candidate}' 4 saatlik yeniden örnekleme başarısız: {e}")
+            continue
+
+        bars = []
+        for idx, row in resampled.iterrows():
+            try:
+                bars.append({
+                    "datetime": idx.strftime("%Y-%m-%d %H:%M:%S"),
+                    "high": float(row["High"]),
+                    "low": float(row["Low"]),
+                    "close": float(row["Close"]),
+                })
+            except (TypeError, ValueError):
+                continue
+
+        if bars:
+            return bars[-outputsize:] if len(bars) > outputsize else bars
+        last_err = ValueError(f"'{candidate}' için 4 saatlik bar üretilemedi.")
+
+    if rate_limited:
+        raise ValueError(
+            "Yahoo Finance şu anda istek limiti uyguluyor (Too Many Requests). "
+            "Lütfen birkaç dakika sonra tekrar deneyin."
+        )
+    raise ValueError(f"yfinance: '{user_symbol}' için 4 saatlik veri alınamadı ({last_err}).")
 
 
 def fetch_bars_yfinance(user_symbol: str, interval: str, outputsize: int):
@@ -551,9 +501,6 @@ def fetch_bars_yfinance(user_symbol: str, interval: str, outputsize: int):
 # ANA fetch_bars FONKSİYONU
 # ----------------------------------------------------------------------------
 
-# 1 ons = 31.1034768 gram. XAUTRYG (Gram Altın/TL) hiçbir sağlayıcıda tek bir
-# sembol olarak bulunmuyor; (XAU/USD / 31.1034768) * USD/TRY formülüyle
-# TÜRETİLİR.
 GRAMS_PER_TROY_OUNCE = 31.1034768
 
 
@@ -564,12 +511,13 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
       2) XU100/XU030/XU500 -> doğrudan isyatirimhisse (İş Yatırım).
       3) Diğer her şey -> önce Twelve Data; 'UPGRADE_REQUIRED' hatası
          alırsa (ücretsiz planda kapalı sembol) sırasıyla:
-         MetalpriceAPI (sadece XAG/XPT/XPD için) -> Stooq -> yfinance denenir.
+         MetalpriceAPI (sadece XAG/XPT/XPD için) -> yfinance denenir.
+         (Stooq, sık başarısız olduğu ve rate-limit sorunları yarattığı
+         için zincirden çıkarıldı.)
     """
     normalized_input = user_symbol.strip().upper().replace(" ", "")
 
     if normalized_input in ("XAUTRYG", "GRAMALTIN"):
-        # Formül: (XAUUSD / 31.1034768) * USDTRY
         xau_bars = fetch_bars("XAUUSD", interval, outputsize)
         usdtry_bars = fetch_bars("USDTRY", interval, outputsize)
         usdtry_by_date = {b["datetime"]: b for b in usdtry_bars}
@@ -578,7 +526,7 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
         for xb in xau_bars:
             ub = usdtry_by_date.get(xb["datetime"])
             if ub is None:
-                continue  # o tarihte eşleşen USDTRY verisi yoksa bu günü atla
+                continue
             xb_close = xb.get("close", (float(xb["high"]) + float(xb["low"])) / 2)
             ub_close = ub.get("close", (float(ub["high"]) + float(ub["low"])) / 2)
             result.append({
@@ -606,7 +554,6 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
     fallback_sources = []
     if normalized_input in METALPRICEAPI_SYMBOL_MAP and METALPRICEAPI_KEY:
         fallback_sources.append(("MetalpriceAPI", fetch_bars_metalpriceapi))
-    fallback_sources.append(("Stooq", fetch_bars_stooq))
     fallback_sources.append(("yfinance", fetch_bars_yfinance))
 
     errors = []
@@ -664,17 +611,6 @@ def get_last_completed_year_range(today: date):
     return date(last_year, 1, 1), date(last_year, 12, 31)
 
 
-# ----------------------------------------------------------------------------
-# HEDEF DÖNEM SINIRLARI
-# ----------------------------------------------------------------------------
-# Denge aralığı mantığı: bir önceki TAMAMLANMIŞ dönemin (gün/hafta/ay/...)
-# verisinden hesaplanan Denge/Ortalama/Direnç/Destek seviyeleri, o dönemin
-# kendisi için değil, BİR SONRAKİ (şu an içinde bulunulan / gelecek) dönem
-# için geçerlidir. Örn: Temmuz'un günlük mumlarından hesaplanan Aylık
-# seviyeler, Ağustos ayı boyunca kullanılacak seviyelerdir.
-# Bu yüzden ekranda gösterilen tarih aralığı, verinin geldiği dönem değil,
-# seviyelerin GEÇERLİ OLDUĞU (hedef) dönem olmalıdır.
-
 def get_current_day_range(today: date):
     return today, today
 
@@ -687,7 +623,6 @@ def get_current_week_range(today: date, is_crypto: bool = False):
         return monday, sunday
 
     if weekday >= 5:
-        # Hafta sonu: piyasa kapalı, hedef BİR SONRAKİ hafta (Pzt-Cum).
         next_monday = today - timedelta(days=weekday) + timedelta(days=7)
         next_friday = next_monday + timedelta(days=4)
         return next_monday, next_friday
@@ -698,8 +633,6 @@ def get_current_week_range(today: date, is_crypto: bool = False):
 
 
 def _next_trading_day(today: date, is_crypto: bool = False) -> date:
-    """Kripto için her gün işlem günüdür. Diğerlerinde hafta sonuysa
-    bir sonraki Pazartesi'ye kaydırılır (Günlük/4 Saatlik hedef tarihi için)."""
     if is_crypto:
         return today
     d = today
@@ -749,7 +682,6 @@ def _filter_by_range(bars, start: date, end: date):
 
 
 def _bar_close(bar: dict) -> float:
-    """Bar içinde 'close' varsa onu, yoksa high/low ortalamasını döndürür."""
     close_val = bar.get("close")
     if close_val is not None:
         try:
@@ -760,11 +692,6 @@ def _bar_close(bar: dict) -> float:
 
 
 def _aggregate_daily_to_weekly(daily_bars):
-    """Günlük barları hafta bazında (Pazartesi başlangıçlı) toplayıp haftalık
-    OHLC (high/low/close) üretir. datetime olarak o haftanın en güncel (son)
-    günü kullanılır. MetalpriceAPI gibi ayrı bir haftalık endpoint'i olmayan
-    kaynaklar için kullanılır (sadece 1 günlük istekle hem günlük hem haftalık
-    ihtiyacı karşılamak, API kotasını korumak için)."""
     weeks = {}
     for bar in sorted(daily_bars, key=lambda b: b["datetime"]):
         d = datetime.strptime(bar["datetime"][:10], "%Y-%m-%d").date()
@@ -830,10 +757,6 @@ def _levels_from_bars(bars, birim: str = "gün") -> dict:
         h = round(float(bar["high"]), 4)
         l = round(float(bar["low"]), 4)
         values.append(h)
-        # high == low ise (ör. BIST endekslerinde gerçek yüksek/düşük veri
-        # olmadığı için ikisi de kapanışa eşitleniyor), aynı değeri iki kez
-        # eklemek o barı yapay olarak "tekrarlayan seviye" (mod) yapar.
-        # Bu yüzden eşitse sadece bir kez sayıyoruz.
         if l != h:
             values.append(l)
 
@@ -891,7 +814,6 @@ def calculate_all_periods(user_symbol: str) -> dict:
     hedef_gun = _next_trading_day(today, is_crypto)
     results = {}
 
-    # Güncel fiyat: en taze veriden (önce 4 saatlik, olmazsa günlük) yakalanır.
     guncel_fiyat = None
     guncel_fiyat_zaman = None
 
@@ -903,8 +825,6 @@ def calculate_all_periods(user_symbol: str) -> dict:
         if last_bar is None:
             raise ValueError("Yeterli 4 saatlik veri bulunamadı.")
         results["4 Saatlik"] = _levels_from_bars([last_bar], birim="adet 4 saatlik mum")
-        # Bu seviyeler son kapanan 4 saatlik mumdan hesaplanır ama BİR SONRAKİ
-        # 4 saatlik mum için geçerlidir; tarih etiketi bugünü gösterir.
         results["4 Saatlik"]["baslangic"] = hedef_gun.isoformat()
         results["4 Saatlik"]["bitis"] = hedef_gun.isoformat()
         guncel_fiyat = _bar_close(last_bar)
@@ -934,7 +854,6 @@ def calculate_all_periods(user_symbol: str) -> dict:
         try:
             bars = _last_completed_day_bars(daily_bars, today)
             results["Günlük"] = _levels_from_bars(bars, birim="gün")
-            # Son kapanan günden hesaplanır, BUGÜN için geçerlidir.
             results["Günlük"]["baslangic"] = hedef_gun.isoformat()
             results["Günlük"]["bitis"] = hedef_gun.isoformat()
         except Exception as e:
