@@ -749,7 +749,3 @@ def calculate_all_periods(user_symbol: str) -> dict:
             hedef_start, hedef_end = get_current_year_range(today)
             results["Yıllık"]["baslangic"] = hedef_start.isoformat()
             results["Yıllık"]["bitis"] = hedef_end.isoformat()
-        except Exception as e:
-            results["Yıllık"] = {"hata": str(e)}
-
-    results["_guncel_fiy
