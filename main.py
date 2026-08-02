@@ -17,10 +17,18 @@ hatası verdiği için şu iyileştirmeler eklendi:
     aylık) gereksiz yere kaynağı tekrar tekrar yormuyor.
   - "Too many requests / rate limit" durumu ayrı ve daha anlaşılır bir
     hata mesajıyla kullanıcıya bildiriliyor.
+
+GÜNCELLEME NOTU 2: Telegram mesajları artık Markdown yerine HTML parse_mode
+ile gönderiliyor. Eski Markdown (V1) ayrıştırıcısı, dinamik içerikte (hata
+mesajları, sembol adları vb.) birden fazla *, _, ` gibi özel karakter iç
+içe geçtiğinde çok kolay bozuluyor ve "Can't parse entities" BadRequest
+hatasıyla mesajın TAMAMEN gönderilmesini engelliyordu. HTML modu hem daha
+az kırılgan hem de dinamik metinler html.escape() ile güvenle kaçırılabiliyor.
 """
 
 import os
 import time
+import html
 import logging
 import statistics
 from collections import Counter
@@ -30,6 +38,7 @@ from zoneinfo import ZoneInfo
 import requests
 from dotenv import load_dotenv
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 try:
@@ -614,7 +623,7 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
         try:
             return fetch_fn(user_symbol, interval, outputsize)
         except Exception as source_err:
-            logger.info(f"🔄 '{user_symbol}' {name} başarısız oldu, sıradaki deneniyor... ({source_err})")
+            logger.warning(f"🔄 '{user_symbol}' {name} başarısız oldu, sıradaki deneniyor... ({source_err})")
             errors.append(f"{name} ({source_err})")
 
     raise ValueError(
@@ -1017,15 +1026,15 @@ CONFIRMATION_NOTES = {
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✨ *Denge Aralığı Botu* ✨\n\n"
-        "Bana bir enstrüman kodu gönder (örn: *BTCUSD*, *XAUUSD*, *XAGUSD*, *XPTUSD*, "
-        "*XPDUSD*, *EURUSD*, *DXY*, *VIX*, *XU100*, *XU030*, *XU500*, *XAUTRYG*).\n\n"
+        "✨ <b>Denge Aralığı Botu</b> ✨\n\n"
+        "Bana bir enstrüman kodu gönder (örn: <b>BTCUSD</b>, <b>XAUUSD</b>, <b>XAGUSD</b>, <b>XPTUSD</b>, "
+        "<b>XPDUSD</b>, <b>EURUSD</b>, <b>DXY</b>, <b>VIX</b>, <b>XU100</b>, <b>XU030</b>, <b>XU500</b>, <b>XAUTRYG</b>).\n\n"
         "🕐 Günlük  📅 Haftalık  🗓️ Aylık  📈 6 Aylık  🏆 Yıllık\n"
         "için Denge (Medyan), Aritmetik Ortalama, Direnç 1/2 ve Destek 1/2 "
         "seviyelerini hesaplayayım.\n\n"
-        "_Yalnızca TAMAMLANMIŞ (kapanmış) son periyot kullanılır._\n"
-        "_6 Aylık ve Yıllık, API kredi limiti nedeniyle haftalık mumlarla hesaplanır._",
-        parse_mode="Markdown",
+        "<i>Yalnızca TAMAMLANMIŞ (kapanmış) son periyot kullanılır.</i>\n"
+        "<i>6 Aylık ve Yıllık, API kredi limiti nedeniyle haftalık mumlarla hesaplanır.</i>",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -1038,10 +1047,11 @@ def format_period_block(period_name: str, result: dict) -> str:
     icon = PERIOD_ICONS.get(period_name, "•")
 
     if "hata" in result:
-        return f"{icon} *{period_name}*\n⚠️ _{result['hata']}_"
+        hata_escaped = html.escape(str(result["hata"]))
+        return f"{icon} <b>{html.escape(period_name)}</b>\n⚠️ <i>{hata_escaped}</i>"
 
-    birim_etiketi = f"{result['adet']} {result['birim']} verisiyle hesaplandı"
-    tarih_araligi = f"{_format_tr_date(result['baslangic'])} → {_format_tr_date(result['bitis'])}"
+    birim_etiketi = html.escape(f"{result['adet']} {result['birim']} verisiyle hesaplandı")
+    tarih_araligi = html.escape(f"{_format_tr_date(result['baslangic'])} → {_format_tr_date(result['bitis'])}")
 
     def row(label: str, value: float, emoji: str = "") -> str:
         full_label = f"{emoji} {label}" if emoji else label
@@ -1059,22 +1069,22 @@ def format_period_block(period_name: str, result: dict) -> str:
     ])
 
     lines = [
-        f"{icon} *{period_name}*",
-        f"_{birim_etiketi}_",
-        f"_📆 Geçerlilik: {tarih_araligi}_",
-        f"```\n{table}\n```",
+        f"{icon} <b>{html.escape(period_name)}</b>",
+        f"<i>{birim_etiketi}</i>",
+        f"<i>📆 Geçerlilik: {tarih_araligi}</i>",
+        f"<pre>{html.escape(table)}</pre>",
     ]
 
     if result["mod"]:
         mod_str = ", ".join(f"{v:,.2f}" for v in result["mod"])
-        lines.append(f"🔁 _Mod (tekrarlayan seviye): {mod_str}_")
+        lines.append(f"🔁 <i>Mod (tekrarlayan seviye): {mod_str}</i>")
 
     if result.get("uyari"):
-        lines.append(f"_{result['uyari']}_")
+        lines.append(f"<i>{html.escape(result['uyari'])}</i>")
 
     confirmation_note = CONFIRMATION_NOTES.get(period_name)
     if confirmation_note:
-        lines.append(f"📌 _Onay: {confirmation_note}, Denge'nin üstünde ya da altında kapanmalı_")
+        lines.append(f"📌 <i>Onay: {html.escape(confirmation_note)}, Denge'nin üstünde ya da altında kapanmalı</i>")
 
     return "\n".join(lines)
 
@@ -1090,8 +1100,8 @@ def _format_current_price_line(guncel_fiyat, guncel_fiyat_zaman):
             zaman_str = guncel_fiyat_zaman.strftime("%d.%m.%Y %H:%M")
     fiyat_str = f"{guncel_fiyat:,.2f}"
     if zaman_str:
-        return f"💵 *Güncel Fiyat:* `{fiyat_str}`  _({zaman_str} itibarıyla)_"
-    return f"💵 *Güncel Fiyat:* `{fiyat_str}`"
+        return f"💵 <b>Güncel Fiyat:</b> <code>{fiyat_str}</code>  <i>({zaman_str} itibarıyla)</i>"
+    return f"💵 <b>Güncel Fiyat:</b> <code>{fiyat_str}</code>"
 
 
 async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1104,7 +1114,7 @@ async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     separator = "━" * 24
-    header_blocks = [f"💰 *{user_symbol.upper()}*"]
+    header_blocks = [f"💰 <b>{html.escape(user_symbol.upper())}</b>"]
     if guncel_fiyat_satiri:
         header_blocks.append(guncel_fiyat_satiri)
     header_blocks.append(separator)
@@ -1118,13 +1128,13 @@ async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = "\n".join(blocks).strip()
 
     if len(message) <= 4000:
-        await processing_msg.edit_text(message, parse_mode="Markdown")
+        await processing_msg.edit_text(message, parse_mode=ParseMode.HTML)
     else:
         await processing_msg.delete()
-        await update.message.reply_text("\n".join(header_blocks), parse_mode="Markdown")
+        await update.message.reply_text("\n".join(header_blocks), parse_mode=ParseMode.HTML)
         for period_name in PERIOD_NAMES:
             block = format_period_block(period_name, results.get(period_name, {"hata": "sonuç yok"}))
-            await update.message.reply_text(block, parse_mode="Markdown")
+            await update.message.reply_text(block, parse_mode=ParseMode.HTML)
 
 
 def main():
