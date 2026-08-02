@@ -753,13 +753,4 @@ def calculate_all_periods(user_symbol: str) -> dict:
             results["Yıllık"] = {"hata": str(e)}
 
     results["_guncel_fiyat"] = guncel_fiyat
-    results["_guncel_fiyat_zaman"] = guncel_fiyat_zaman
-    return results
-
-
-# ----------------------------------------------------------------------------
-# TELEGRAM BOTU
-# ----------------------------------------------------------------------------
-
-PERIOD_ICONS = {
-    "4 Saatlik": "🕓
+    results["_guncel
