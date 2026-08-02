@@ -359,18 +359,11 @@ YFINANCE_FUTURES_FALLBACK = {
     "XPDUSD": "PA=F",   # Paladyum vadeli
 }
 
-# yfinance'in kendi Session'ı - tarayıcı benzeri header'larla, tekrar
-# tekrar yeni Session oluşturmamak için modül seviyesinde bir kez kurulur.
-_YFINANCE_SESSION = None
-
-
-def _get_yfinance_session():
-    global _YFINANCE_SESSION
-    if _YFINANCE_SESSION is None:
-        session = requests.Session()
-        session.headers.update(BROWSER_HEADERS)
-        _YFINANCE_SESSION = session
-    return _YFINANCE_SESSION
+# NOT: yfinance'e dışarıdan sade bir requests.Session vermek, kütüphanenin
+# kendi iç kimlik doğrulama (crumb/cookie) mekanizmasını devre dışı bırakıp
+# TÜM istekleri "Too Many Requests" gibi görünen kalıcı bir hataya
+# sokabiliyor. Bu yüzden burada session'ı KASITLI OLARAK yfinance'in kendi
+# varsayılan yönetimine bırakıyoruz (session parametresi vermiyoruz).
 
 
 def _normalize_yfinance_symbol(user_symbol: str) -> str:
@@ -403,8 +396,6 @@ def _fetch_bars_yfinance_uncached(user_symbol: str, interval: str, outputsize: i
     days_multiplier = 7 if yf_interval == "1wk" else 2
     period_days = min(outputsize * days_multiplier + 30, 3650)
 
-    session = _get_yfinance_session()
-
     last_err = None
     rate_limited = False
     max_attempts = 3
@@ -412,7 +403,7 @@ def _fetch_bars_yfinance_uncached(user_symbol: str, interval: str, outputsize: i
     for candidate in candidates:
         for attempt in range(max_attempts):
             try:
-                df = yf.Ticker(candidate, session=session).history(
+                df = yf.Ticker(candidate).history(
                     period=f"{period_days}d",
                     interval=yf_interval,
                     auto_adjust=False,
