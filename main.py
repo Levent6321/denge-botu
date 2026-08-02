@@ -315,20 +315,33 @@ def _fetch_bars_metalpriceapi_uncached(user_symbol: str, interval: str, outputsi
     if metal_code is None:
         raise ValueError(f"MetalpriceAPI '{user_symbol}' sembolünü desteklemiyor.")
 
-    today = datetime.now(TR_TZ).date()
-    # ÖNEMLİ: MetalpriceAPI ücretsiz planı 30 günden eski tarihli sorguları
-    # reddediyor ("Querying older than 30 days requires a paid plan").
-    # Bu yüzden 365 gün yerine, güvenli bir tampon bırakarak 28 günle
-    # sınırlıyoruz. Bu, Günlük/Haftalık ve genelde Aylık'ın büyük kısmını
-    # karşılar; 6 Aylık/Yıllık gibi çok daha eski veri gerektiren periyotlar
-    # bu kaynaktan hiçbir zaman tam dolduramaz (ücretli plan gerektirir),
-    # ama en azından çirkin bir API hatası yerine düzgün "veri yok" mesajı
-    # gösterilir.
-    FREE_PLAN_MAX_LOOKBACK_DAYS = 28
+    # ÖNEMLİ - DOĞRULANMIŞ ÜCRETSİZ PLAN SINIRLARI (canlı API hatalarıyla teyit edildi):
+    #   1) "Querying older than 30 days requires a paid plan" -> 30 günden
+    #      eski tarih sorgulanamıyor.
+    #   2) "Timeframe queries exceeding 5 days require a paid plan" -> tek
+    #      istekteki start/end aralığı en fazla 5 gün olabiliyor.
+    # Bu ikinci sınır, geniş bir aralığı tek istekle çekip günlük/haftalık
+    # ihtiyacı birlikte karşılama planını (365 günlük istek) tamamen
+    # geçersiz kılıyor. Pratik sonuç:
+    #   - "1day" (Günlük/Haftalık/Aylık için kaynak): sadece son birkaç
+    #     güne sığan, güvenli 4 günlük bir pencere denenir. Bu genelde
+    #     Günlük'ü karşılar; Haftalık/Aylık için yeterli olmayabilir ama en
+    #     azından API hata vermeden düzgün "veri yok" ile sonuçlanır.
+    #   - "1week" (6 Aylık/Yıllık için kaynak): haftalık toplulaştırma aylar
+    #     sürecek geniş bir aralık gerektirir, 5 günlük pencereye asla
+    #     sığmaz. Boşuna kota/ağ harcamamak için istek hiç atılmadan direkt
+    #     hata döndürülür; sıradaki kaynağa (Stooq) geçilir.
+    FREE_PLAN_MAX_RANGE_DAYS = 4  # 5 günlük sınırın altında güvenli tampon
+
     if interval == "1week":
-        days_needed = min(outputsize * 7 + 14, FREE_PLAN_MAX_LOOKBACK_DAYS)
-    else:
-        days_needed = min(outputsize + 14, FREE_PLAN_MAX_LOOKBACK_DAYS)
+        raise ValueError(
+            "MetalpriceAPI ücretsiz planında tek seferde en fazla 5 günlük "
+            "aralık sorgulanabiliyor; haftalık toplulaştırma için yetersiz "
+            "(ücretli plan gerekiyor)."
+        )
+
+    today = datetime.now(TR_TZ).date()
+    days_needed = FREE_PLAN_MAX_RANGE_DAYS
     start_date = today - timedelta(days=days_needed)
     # Free planda güncel günün verisi henüz gelmemiş olabilir (bir gün gecikmeli).
     end_date = today - timedelta(days=1)
@@ -366,10 +379,8 @@ def _fetch_bars_metalpriceapi_uncached(user_symbol: str, interval: str, outputsi
     if not daily_bars:
         raise ValueError(f"MetalpriceAPI: '{user_symbol}' için veri bulunamadı.")
 
-    if interval == "1week":
-        weekly_bars = _aggregate_daily_to_weekly(daily_bars)
-        return weekly_bars[-outputsize:] if len(weekly_bars) > outputsize else weekly_bars
-
+    # NOT: "1week" durumu artık bu fonksiyona hiç gelmiyor (yukarıda erken
+    # raise ediliyor), bu yüzden burada sadece günlük bar döndürülür.
     return daily_bars[-outputsize:] if len(daily_bars) > outputsize else daily_bars
 
 
