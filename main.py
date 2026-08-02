@@ -88,7 +88,7 @@ logger = logging.getLogger(__name__)
 # yfinance'i art arda yormasını engeller.
 
 _CACHE: dict[str, tuple[float, object]] = {}
-_CACHE_TTL_SECONDS = 300  # 5 dakika
+_CACHE_TTL_SECONDS = 900  # 15 dakika (Yahoo/Stooq rate-limit riskini azaltmak için)
 
 
 def _cached_fetch(cache_key: str, fetch_fn):
