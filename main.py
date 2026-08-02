@@ -50,6 +50,11 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
+# metalpriceapi.com - XAGUSD/XPTUSD/XPDUSD için Stooq/Yahoo'dan ÖNCE denenen,
+# API key ile çalışan (scraping olmayan) stabil ücretsiz kaynak.
+# ÖNEMLİ: Bu key'i asla kod içine yazıp commit ETMEYİN (repo public!).
+# Railway/Heroku ortam değişkenlerine METALPRICEAPI_KEY adıyla ekleyin.
+METALPRICEAPI_KEY = os.getenv("METALPRICEAPI_KEY")
 
 TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
 
@@ -269,7 +274,96 @@ def fetch_bars_bist_index(user_symbol: str, interval: str, outputsize: int):
 
 
 # ----------------------------------------------------------------------------
-# VERİ ÇEKME - YEDEK KAYNAK: Stooq (sadece Twelve Data başarısız olursa)
+# VERİ ÇEKME - YEDEK KAYNAK: MetalpriceAPI (sadece XAG/XPT/XPD için, Twelve
+# Data kapalıysa Stooq/Yahoo'dan ÖNCE denenir)
+# ----------------------------------------------------------------------------
+# metalpriceapi.com, API key ile çalışan gerçek bir servistir (scraping
+# değildir), bu yüzden Stooq/Yahoo'nun yaşadığı "bot sanılıp engellenme"
+# riski yoktur. Ücretsiz planda ayda 100 istek hakkı var; bu yüzden burada
+# tek bir "timeframe" isteğiyle (365 güne kadar) hem günlük hem haftalık
+# ihtiyacı karşılıyoruz (haftalık barlar günlük veriden yerel olarak
+# toplanıyor), kotayı en verimli şekilde kullanmak için.
+
+METALPRICEAPI_URL = "https://api.metalpriceapi.com/v1/timeframe"
+
+# Bu bot sadece Twelve Data'da kapalı olan metaller için MetalpriceAPI'yi
+# dener; DXY/VIX gibi metal olmayan semboller için bu kaynak atlanır.
+METALPRICEAPI_SYMBOL_MAP = {
+    "XAGUSD": "XAG",  # Gümüş
+    "XPTUSD": "XPT",  # Platin
+    "XPDUSD": "XPD",  # Paladyum
+}
+
+
+def _fetch_bars_metalpriceapi_uncached(user_symbol: str, interval: str, outputsize: int):
+    if interval == "4h":
+        raise ValueError("MetalpriceAPI kaynağında 4 saatlik veri yok.")
+    if not METALPRICEAPI_KEY:
+        raise ValueError("METALPRICEAPI_KEY tanımlı değil.")
+
+    normalized_input = user_symbol.strip().upper().replace(" ", "")
+    metal_code = METALPRICEAPI_SYMBOL_MAP.get(normalized_input)
+    if metal_code is None:
+        raise ValueError(f"MetalpriceAPI '{user_symbol}' sembolünü desteklemiyor.")
+
+    today = datetime.now(TR_TZ).date()
+    # 365 gün, API'nin timeframe endpoint'indeki maksimum aralık.
+    if interval == "1week":
+        days_needed = min(outputsize * 7 + 14, 365)
+    else:
+        days_needed = min(outputsize + 14, 365)
+    start_date = today - timedelta(days=days_needed)
+    # Free planda güncel günün verisi henüz gelmemiş olabilir (bir gün gecikmeli).
+    end_date = today - timedelta(days=1)
+
+    params = {
+        "api_key": METALPRICEAPI_KEY,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "base": "USD",
+        "currencies": metal_code,
+    }
+
+    try:
+        resp = requests.get(METALPRICEAPI_URL, params=params, timeout=15)
+        data = resp.json()
+    except Exception as e:
+        raise ValueError(f"MetalpriceAPI'ye bağlanılamadı: {e}")
+
+    if not data.get("success"):
+        err = data.get("error", {})
+        raise ValueError(f"MetalpriceAPI hata: {err.get('info', data)}")
+
+    usd_key = f"USD{metal_code}"
+    daily_bars = []
+    for date_str, values in sorted((data.get("rates") or {}).items()):
+        price = values.get(usd_key)
+        if price is None:
+            continue
+        price = float(price)
+        # Bu kaynak sadece tek bir günlük fiyat verir (OHLC değil); high/low
+        # olarak aynı değeri kullanıyoruz (BIST endeksleri için de aynı
+        # yaklaşım zaten uygulanıyor).
+        daily_bars.append({"datetime": date_str, "high": price, "low": price, "close": price})
+
+    if not daily_bars:
+        raise ValueError(f"MetalpriceAPI: '{user_symbol}' için veri bulunamadı.")
+
+    if interval == "1week":
+        weekly_bars = _aggregate_daily_to_weekly(daily_bars)
+        return weekly_bars[-outputsize:] if len(weekly_bars) > outputsize else weekly_bars
+
+    return daily_bars[-outputsize:] if len(daily_bars) > outputsize else daily_bars
+
+
+def fetch_bars_metalpriceapi(user_symbol: str, interval: str, outputsize: int):
+    """MetalpriceAPI çağrısını önbellekle sarmalar (100 istek/ay kotasını korumak için)."""
+    cache_key = f"metalpriceapi:{user_symbol.strip().upper()}:{interval}:{outputsize}"
+    return _cached_fetch(cache_key, lambda: _fetch_bars_metalpriceapi_uncached(user_symbol, interval, outputsize))
+
+
+# ----------------------------------------------------------------------------
+# VERİ ÇEKME - YEDEK KAYNAK: Stooq (MetalpriceAPI de başarısız/uygun değilse)
 # ----------------------------------------------------------------------------
 
 def _fetch_bars_stooq_uncached(user_symbol: str, interval: str, outputsize: int):
@@ -469,7 +563,8 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
       1) XAUTRYG -> XAUUSD ve USDTRY üzerinden TÜRETİLİR.
       2) XU100/XU030/XU500 -> doğrudan isyatirimhisse (İş Yatırım).
       3) Diğer her şey -> önce Twelve Data; 'UPGRADE_REQUIRED' hatası
-         alırsa (ücretsiz planda kapalı sembol) Stooq denenir (garantisiz).
+         alırsa (ücretsiz planda kapalı sembol) sırasıyla:
+         MetalpriceAPI (sadece XAG/XPT/XPD için) -> Stooq -> yfinance denenir.
     """
     normalized_input = user_symbol.strip().upper().replace(" ", "")
 
@@ -503,20 +598,28 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
     try:
         return fetch_bars_twelvedata(user_symbol, interval, outputsize)
     except ValueError as e:
-        if str(e) == "UPGRADE_REQUIRED":
-            logger.info(f"🔄 '{user_symbol}' Twelve Data ücretsiz planda kapalı, Stooq deneniyor...")
-            try:
-                return fetch_bars_stooq(user_symbol, interval, outputsize)
-            except Exception as stooq_err:
-                logger.info(f"🔄 '{user_symbol}' Stooq da başarısız oldu, yfinance deneniyor... ({stooq_err})")
-                try:
-                    return fetch_bars_yfinance(user_symbol, interval, outputsize)
-                except Exception as yf_err:
-                    raise ValueError(
-                        f"Twelve Data ücretsiz planda kapalı; Stooq ({stooq_err}) ve "
-                        f"yfinance ({yf_err}) denemeleri de başarısız oldu."
-                    )
-        raise
+        if str(e) != "UPGRADE_REQUIRED":
+            raise
+
+    logger.info(f"🔄 '{user_symbol}' Twelve Data ücretsiz planda kapalı, yedek kaynaklar deneniyor...")
+
+    fallback_sources = []
+    if normalized_input in METALPRICEAPI_SYMBOL_MAP and METALPRICEAPI_KEY:
+        fallback_sources.append(("MetalpriceAPI", fetch_bars_metalpriceapi))
+    fallback_sources.append(("Stooq", fetch_bars_stooq))
+    fallback_sources.append(("yfinance", fetch_bars_yfinance))
+
+    errors = []
+    for name, fetch_fn in fallback_sources:
+        try:
+            return fetch_fn(user_symbol, interval, outputsize)
+        except Exception as source_err:
+            logger.info(f"🔄 '{user_symbol}' {name} başarısız oldu, sıradaki deneniyor... ({source_err})")
+            errors.append(f"{name} ({source_err})")
+
+    raise ValueError(
+        f"Twelve Data ücretsiz planda kapalı; " + "; ".join(errors) + " denemeleri de başarısız oldu."
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -654,6 +757,41 @@ def _bar_close(bar: dict) -> float:
         except (TypeError, ValueError):
             pass
     return (float(bar["high"]) + float(bar["low"])) / 2
+
+
+def _aggregate_daily_to_weekly(daily_bars):
+    """Günlük barları hafta bazında (Pazartesi başlangıçlı) toplayıp haftalık
+    OHLC (high/low/close) üretir. datetime olarak o haftanın en güncel (son)
+    günü kullanılır. MetalpriceAPI gibi ayrı bir haftalık endpoint'i olmayan
+    kaynaklar için kullanılır (sadece 1 günlük istekle hem günlük hem haftalık
+    ihtiyacı karşılamak, API kotasını korumak için)."""
+    weeks = {}
+    for bar in sorted(daily_bars, key=lambda b: b["datetime"]):
+        d = datetime.strptime(bar["datetime"][:10], "%Y-%m-%d").date()
+        monday = d - timedelta(days=d.weekday())
+        key = monday.isoformat()
+        h = float(bar["high"])
+        l = float(bar["low"])
+        c = float(bar.get("close", h))
+        if key not in weeks:
+            weeks[key] = {"high": h, "low": l, "close": c, "last_date": d}
+        else:
+            w = weeks[key]
+            w["high"] = max(w["high"], h)
+            w["low"] = min(w["low"], l)
+            if d >= w["last_date"]:
+                w["close"] = c
+                w["last_date"] = d
+    result = []
+    for key in sorted(weeks.keys()):
+        w = weeks[key]
+        result.append({
+            "datetime": w["last_date"].isoformat(),
+            "high": w["high"],
+            "low": w["low"],
+            "close": w["close"],
+        })
+    return result
 
 
 CRYPTO_BASES = {
