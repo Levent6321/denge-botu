@@ -280,6 +280,15 @@ def _fetch_bars_metalpriceapi_uncached(user_symbol: str, interval: str, outputsi
         days_needed = min(outputsize * 7 + 14, 365)
     else:
         days_needed = min(outputsize + 14, 365)
+
+    # Ücretsiz plan sadece son 30 günü destekliyor; daha eskisi 'paid plan'
+    # hatası veriyor. Bu durumda API'ye hiç istek atmadan erken çıkıyoruz.
+    if days_needed > 30:
+        raise ValueError(
+            "MetalpriceAPI ücretsiz planı yalnızca son 30 günü destekliyor "
+            f"(bu istek {days_needed} gün geriye gidiyor)."
+        )
+
     start_date = today - timedelta(days=days_needed)
     end_date = today - timedelta(days=1)
 
@@ -953,11 +962,27 @@ def _format_tr_date(iso_date: str) -> str:
     return d.strftime("%d.%m.%Y")
 
 
+# Telegram'ın eski "Markdown" modu _..._ / *...* / `...` / [...] karakterlerini
+# biçimlendirme olarak yorumluyor. Hata mesajları ham exception metni
+# (ör. dış API'lerden gelen JSON) içerebildiği için içlerinde bu karakterler
+# geçtiğinde (özellikle '_' -> "api_timeframe" gibi) entity'ler eşleşmez ve
+# Telegram "Can't parse entities" hatasıyla mesajı tümden reddeder. Bu yüzden
+# mesaj gövdesine gömülen HER dinamik/harici metin önce kaçışlanır.
+_MARKDOWN_ESCAPE_CHARS = ("_", "*", "`", "[")
+
+
+def _escape_markdown(text: str) -> str:
+    text = str(text)
+    for ch in _MARKDOWN_ESCAPE_CHARS:
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
 def format_period_block(period_name: str, result: dict) -> str:
     icon = PERIOD_ICONS.get(period_name, "•")
 
     if "hata" in result:
-        return f"{icon} *{period_name}*\n⚠️ _{result['hata']}_"
+        return f"{icon} *{period_name}*\n⚠️ _{_escape_markdown(result['hata'])}_"
 
     birim_etiketi = f"{result['adet']} {result['birim']} verisiyle hesaplandı"
     tarih_araligi = f"{_format_tr_date(result['baslangic'])} → {_format_tr_date(result['bitis'])}"
@@ -1023,7 +1048,7 @@ async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     separator = "━" * 24
-    header_blocks = [f"💰 *{user_symbol.upper()}*"]
+    header_blocks = [f"💰 *{_escape_markdown(user_symbol.upper())}*"]
     if guncel_fiyat_satiri:
         header_blocks.append(guncel_fiyat_satiri)
     header_blocks.append(separator)
