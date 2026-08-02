@@ -6,50 +6,23 @@ DENGE ARALIĞI TELEGRAM BOTU (3 Kaynaklı Hibrit Model)
 3) MetalpriceAPI / yfinance (yedek) -> Twelve Data'da ücretsiz planda kapalı
                         olan XAGUSD, XPTUSD, XPDUSD, VIX, DXY gibi semboller
                         için denenir (garantisi yoktur).
-XAUTRYG (Gram Altın/TL) ve GMSTR (Gram Gümüş/TL) ise XAUUSD/XAGUSD ve
-USDTRY üzerinden TÜRETİLİR. GLDTR, XAUTRYG'nin alias'ıdır.
+XAUTRYG (Gram Altın/TL) ise XAUUSD ve USDTRY üzerinden TÜRETİLİR.
 
-GÜNCELLEME NOTU (3. revizyon):
-  - Yeni semboller eklendi: GMSTR (Gram Gümüş/TL), GLDTR (Gram Altın/TL,
-    XAUTRYG alias'ı), DXY (Dolar Endeksi), VIX (Volatilite Endeksi),
-    SPX/S&P500 (S&P 500), NDX (Nasdaq 100), DJI (Dow Jones), UKOIL
-    (Brent Petrol).
-  - Bu endeksler (DXY, VIX, SPX, NDX, DJI) genelde Twelve Data'nın
-    ücretsiz planında kapalı olduğu için otomatik olarak yfinance
-    yedeğine düşer (^VIX, DX-Y.NYB, ^GSPC, ^NDX, ^DJI sembolleriyle).
-  - UKOIL (Brent) 5 karakterli olduğu için eski normalize_symbol onu
-    yanlışlıkla "UK/OIL" gibi ikiye bölüyordu; bu artık düzeltildi ve
-    yfinance yedeğinde "BZ=F" (Brent vadeli) kullanılıyor.
-  - Önceki notlar (Stooq kaldırıldı, 4h resample, User-Agent, retry/backoff,
-    5-15 dk önbellek) korunuyor.
-
-GÜNCELLEME NOTU (4. revizyon - yfinance "Too Many Requests" düzeltmesi):
-  - Yahoo, son dönemde bulut/veri merkezi IP'lerinden (Railway, Heroku vb.)
-    gelen normal `requests` tabanlı isteklere karşı çok daha agresif bir
-    bot-engelleme (429 Too Many Requests) uyguluyor. Bu, XAGUSD gibi 3
-    kaynağı da olan sembollerde bile SON çare olan yfinance'in tamamen
-    başarısız olmasına yol açabiliyor.
-  - DENENDİ VE GERİ ALINDI: `curl_cffi` ile tarayıcı-taklitli oturum
-    denendi, ancak yfinance'in çerez/crumb işleme kodunda ÇÖZÜLMEMİŞ,
-    bilinen bir hataya yol açtığı görüldü ("'str' object has no
-    attribute 'name'" - bkz. yfinance GitHub issue #2429, #2461, #2470,
-    #2494, #2684). Bu yüzden curl_cffi entegrasyonu KALDIRILDI; yfinance
-    yine kendi varsayılan (curl_cffi'siz) oturum yönetimini kullanıyor.
-  - Bunun yerine sadece güvenli/yan etkisiz iyileştirmeler korunuyor:
-    retry deneme sayısı 3'ten 4'e çıkarıldı, bekleme süresine jitter
-    (rastgele ek gecikme) eklendi, önbellek (yfinance) TTL'i 15 dk'dan
-    30 dk'ya çıkarıldı. Kalıcı "Too Many Requests" durumunda tek gerçek
-    çözüm birkaç dakika beklemek veya sunucunun IP'sini değiştirmektir.
-  - YENİ (ücretsiz, Yahoo'dan bağımsız): SPX/NDX/DJI/VIX/DXY/UKOIL için
-    Stooq (stooq.com) eklendi. API key gerekmez, Yahoo'nun IP engellemesi
-    Stooq'u etkilemez; bu yüzden bu semboller için Twelve Data kapalıysa
-    yfinance'ten ÖNCE Stooq denenir. Sadece Günlük/Haftalık veri sağlar
-    (4 Saatlik'te hâlâ yfinance'e bağımlıyız).
+GÜNCELLEME NOTU (2. revizyon):
+  - Stooq, sık "Too Many Requests" hatası verdiği ve XAG/XPT/XPD gibi
+    semboller için genelde başarısız olduğu için yedek zincirinden
+    ÇIKARILDI. Artık sıralama: Twelve Data -> MetalpriceAPI (varsa) ->
+    yfinance.
+  - yfinance artık "4 Saatlik" (4h) aralığını da destekliyor: doğrudan
+    4 saatlik veri sağlamadığı için 60 dakikalık barlar çekilip pandas ile
+    4 saatlik OHLC'ye yeniden örnekleniyor (resample). Bu sayede
+    XAGUSD/XPTUSD/XPDUSD gibi Twelve Data'da kapalı sembollerde de
+    "4 Saatlik" bloğu artık hesaplanabiliyor (önceden hep hata veriyordu).
+  - Önceki notlar (User-Agent, retry/backoff, 5-15 dk önbellek) korunuyor.
 """
 
 import os
 import time
-import random
 import logging
 import statistics
 from collections import Counter
@@ -122,7 +95,7 @@ logger = logging.getLogger(__name__)
 # BASİT BELLEK-İÇİ ÖNBELLEK (rate limit'i azaltmak için)
 # ----------------------------------------------------------------------------
 _CACHE: dict[str, tuple[float, object]] = {}
-_CACHE_TTL_SECONDS = 1800  # 30 dakika (Yahoo rate-limit riskini azaltmak için)
+_CACHE_TTL_SECONDS = 900  # 15 dakika (Yahoo rate-limit riskini azaltmak için)
 
 
 def _cached_fetch(cache_key: str, fetch_fn):
@@ -145,70 +118,13 @@ def _is_rate_limit_text(text: str) -> bool:
 
 
 # ----------------------------------------------------------------------------
-# ENDEKS / TÜRETİLMİŞ SEMBOL TANIMLARI (YENİ)
-# ----------------------------------------------------------------------------
-
-# Twelve Data ve yfinance'e giderken forex gibi ikiye BÖLÜNMEMESİ gereken
-# semboller (endeksler, emtialar). "SPX", "NDX", "DJI", "VIX", "DXY" zaten
-# 3 karakterli oldukları için normalize_symbol'de bölünmüyorlardı; ama
-# "UKOIL" 5 karakterli olduğu için "UK/OIL" gibi yanlış bölünüyordu.
-NO_SPLIT_SYMBOLS = {"UKOIL", "BRENT", "SPX", "NDX", "DJI", "VIX", "DXY"}
-
-# Kullanıcının yazabileceği farklı isimleri kanonik sembole eşler.
-INDEX_ALIASES = {
-    "DXY": "DXY",
-    "VIX": "VIX",
-    "SPX": "SPX", "S&P500": "SPX", "SP500": "SPX", "SPX500": "SPX", "S&P": "SPX",
-    "NDX": "NDX", "NASDAQ100": "NDX", "NAS100": "NDX",
-    "DJI": "DJI", "DOWJONES": "DJI", "DOW": "DJI", "US30": "DJI",
-    "UKOIL": "UKOIL", "BRENT": "UKOIL", "BRENTOIL": "UKOIL",
-}
-
-# Bu endeksler Twelve Data'nın (genelde) ücretsiz planında kapalı olduğu
-# için otomatik olarak yfinance yedeğine düşerler; oradaki karşılıkları:
-YFINANCE_INDEX_MAP = {
-    "DXY": "DX-Y.NYB",
-    "VIX": "^VIX",
-    "SPX": "^GSPC",
-    "NDX": "^NDX",
-    "DJI": "^DJI",
-    "UKOIL": "BZ=F",  # Brent Crude vadeli (doğrudan Brent spot sembolü yfinance'te yok)
-}
-
-# Stooq (stooq.com), Yahoo'dan TAMAMEN BAĞIMSIZ, API key gerektirmeyen
-# ücretsiz bir kaynak. Yahoo'nun IP bazlı rate-limit/engellemesinden
-# etkilenmez; bu yüzden endeksler için yfinance'ten ÖNCE denenir.
-# Semboller stooq.com üzerinden doğrulanmıştır (^ endeksler, .F vadeliler).
-STOOQ_SYMBOL_MAP = {
-    "SPX": "^spx",
-    "NDX": "^ndx",
-    "DJI": "^dji",
-    "VIX": "vi.f",     # CBOE VIX vadeli (Stooq'ta spot ^VIX yok)
-    "DXY": "dx.f",     # ICE US Dolar Endeksi vadeli
-    "UKOIL": "cb.f",   # ICE Brent Petrol vadeli
-}
-
-GRAMS_PER_TROY_OUNCE = 31.1034768
-
-# Gram Altın/TL (XAUTRYG) ve Gram Gümüş/TL (GMSTR) aliasları.
-GRAM_TRY_ALIASES = {
-    # kanonik ad -> (kaynak forex sembolü, aliaslar)
-    "XAUTRYG": ("XAUUSD", {"XAUTRYG", "GRAMALTIN", "GLDTR"}),
-    "GMSTR": ("XAGUSD", {"GMSTR", "GRAMGUMUS", "GUMUSTRYG"}),
-}
-
-
-# ----------------------------------------------------------------------------
 # SEMBOL NORMALİZASYON
 # ----------------------------------------------------------------------------
 
 def normalize_symbol(user_symbol: str) -> str:
-    """'BTCUSD' -> 'BTC/USD', 'XAUUSD' -> 'XAU/USD' gibi Twelve Data formatına çevirir.
-    Endeks/emtia sembolleri (SPX, NDX, DJI, VIX, DXY, UKOIL gibi) ikiye BÖLÜNMEZ."""
+    """'BTCUSD' -> 'BTC/USD', 'XAUUSD' -> 'XAU/USD' gibi Twelve Data formatına çevirir."""
     s = user_symbol.strip().upper().replace(" ", "")
     if "/" in s:
-        return s
-    if s in NO_SPLIT_SYMBOLS:
         return s
     if len(s) > 3:
         base, quote = s[:-3], s[-3:]
@@ -419,71 +335,6 @@ def fetch_bars_metalpriceapi(user_symbol: str, interval: str, outputsize: int):
 
 
 # ----------------------------------------------------------------------------
-# VERİ ÇEKME - ÜCRETSİZ / BAĞIMSIZ YEDEK KAYNAK: Stooq (sadece endeksler)
-# ----------------------------------------------------------------------------
-# Stooq, Yahoo'dan tamamen bağımsız bir sağlayıcı olduğu için Yahoo'nun
-# IP bazlı rate-limit/engellemesinden etkilenmez. API key gerekmez.
-# Sadece Günlük ve Haftalık veri sağlar (4 Saatlik yok).
-
-STOOQ_URL = "https://stooq.com/q/d/l/"
-
-
-def _fetch_bars_stooq_uncached(user_symbol: str, interval: str, outputsize: int):
-    if interval == "4h":
-        raise ValueError("Stooq kaynağında 4 saatlik veri yok.")
-    if interval not in ("1day", "1week"):
-        raise ValueError(f"Stooq kaynağında '{interval}' aralığı desteklenmiyor.")
-
-    normalized_input = user_symbol.strip().upper().replace(" ", "")
-    canonical = INDEX_ALIASES.get(normalized_input, normalized_input)
-    stooq_symbol = STOOQ_SYMBOL_MAP.get(canonical)
-    if stooq_symbol is None:
-        raise ValueError(f"Stooq '{user_symbol}' sembolünü desteklemiyor.")
-
-    i_code = "d" if interval == "1day" else "w"
-    params = {"s": stooq_symbol, "i": i_code}
-
-    try:
-        resp = requests.get(STOOQ_URL, params=params, headers=BROWSER_HEADERS, timeout=15)
-        text = resp.text
-    except Exception as e:
-        raise ValueError(f"Stooq'a bağlanılamadı: {e}")
-
-    if _is_rate_limit_text(text):
-        raise ValueError("Stooq şu anda istek limiti uyguluyor.")
-
-    lines = [ln for ln in text.strip().splitlines() if ln.strip()]
-    if len(lines) < 2 or not lines[0].lower().startswith("date"):
-        raise ValueError(f"Stooq: '{user_symbol}' ({stooq_symbol}) için veri bulunamadı.")
-
-    bars = []
-    for line in lines[1:]:
-        parts = line.split(",")
-        if len(parts) < 5:
-            continue
-        try:
-            bars.append({
-                "datetime": parts[0],
-                "high": float(parts[2]),
-                "low": float(parts[3]),
-                "close": float(parts[4]),
-            })
-        except (ValueError, IndexError):
-            continue
-
-    if not bars:
-        raise ValueError(f"Stooq: '{user_symbol}' için ayrıştırılabilir veri yok.")
-
-    bars.sort(key=lambda b: b["datetime"])
-    return bars[-outputsize:] if len(bars) > outputsize else bars
-
-
-def fetch_bars_stooq(user_symbol: str, interval: str, outputsize: int):
-    cache_key = f"stooq:{user_symbol.strip().upper()}:{interval}:{outputsize}"
-    return _cached_fetch(cache_key, lambda: _fetch_bars_stooq_uncached(user_symbol, interval, outputsize))
-
-
-# ----------------------------------------------------------------------------
 # VERİ ÇEKME - 2. YEDEK KAYNAK: Yahoo Finance (yfinance)
 # ----------------------------------------------------------------------------
 # Twelve Data (ve varsa MetalpriceAPI) başarısız olursa denenir.
@@ -499,12 +350,11 @@ YFINANCE_FUTURES_FALLBACK = {
     "XPDUSD": "PA=F",   # Paladyum vadeli
 }
 
-# NOT: yfinance'e dışarıdan özel bir requests.Session (ister düz
-# `requests`, ister `curl_cffi` ile) vermek denendi; ancak curl_cffi
-# session'ı yfinance'in çerez/crumb işleme kodunda ÇÖZÜLMEMİŞ, bilinen
-# bir hataya yol açıyor ("'str' object has no attribute 'name'").
-# Bu yüzden burada session'ı KASITLI OLARAK yfinance'in kendi varsayılan
-# yönetimine bırakıyoruz (session parametresi vermiyoruz).
+# NOT: yfinance'e dışarıdan sade bir requests.Session vermek, kütüphanenin
+# kendi iç kimlik doğrulama (crumb/cookie) mekanizmasını devre dışı bırakıp
+# TÜM istekleri "Too Many Requests" gibi görünen kalıcı bir hataya
+# sokabiliyor. Bu yüzden burada session'ı KASITLI OLARAK yfinance'in kendi
+# varsayılan yönetimine bırakıyoruz (session parametresi vermiyoruz).
 
 
 def _normalize_yfinance_symbol(user_symbol: str) -> str:
@@ -520,24 +370,16 @@ def _normalize_yfinance_symbol(user_symbol: str) -> str:
 def _yfinance_candidates(user_symbol: str) -> list:
     """Denenecek Yahoo sembollerini önem sırasına göre döndürür.
 
-    - DXY/VIX/SPX/NDX/DJI/UKOIL gibi endeks/emtia sembolleri için doğrudan
-      bilinen Yahoo karşılığı (ör. '^VIX', 'BZ=F') kullanılır.
-    - XAG/XPT/XPD gibi metaller için Yahoo'da doğrudan bir forex sembolü
-      (ör. 'XAGUSD=X') hiçbir zaman bulunmuyor ('possibly delisted' hatası
-      kesin geliyor); bu yüzden bu semboller için normalize edilmiş forex
-      formatını hiç denemeden doğrudan bilinen vadeli işlem sembolünü
-      (ör. 'SI=F') ilk sıraya koyuyoruz.
-    - Diğer tüm semboller için önce normalize edilmiş forex/kripto formatı
-      denenir.
+    XAG/XPT/XPD gibi metaller için Yahoo'da doğrudan bir forex sembolü
+    (ör. 'XAGUSD=X') hiçbir zaman bulunmuyor ('possibly delisted' hatası
+    kesin geliyor); bu yüzden bu semboller için normalize edilmiş forex
+    formatını hiç denemeden doğrudan bilinen vadeli işlem sembolünü
+    (ör. 'SI=F') ilk sıraya koyuyoruz. Diğer tüm semboller için önce
+    normalize edilmiş format, ardından (varsa) vadeli işlem yedeği denenir.
     """
     normalized_input = user_symbol.strip().upper().replace(" ", "")
-    canonical = INDEX_ALIASES.get(normalized_input)
-
-    index_symbol = YFINANCE_INDEX_MAP.get(canonical or normalized_input)
-    if index_symbol is not None:
-        return [index_symbol]
-
     futures_symbol = YFINANCE_FUTURES_FALLBACK.get(normalized_input)
+
     if futures_symbol is not None:
         # Bu sembollerde forex tickerı hiç çalışmadığı için doğrudan vadeliyle başla.
         return [futures_symbol]
@@ -546,11 +388,11 @@ def _yfinance_candidates(user_symbol: str) -> list:
 
 
 def _yf_history_with_retry(candidate: str, period: str, interval: str):
-    """yfinance.Ticker(...).history çağrısını rate-limit için retry/backoff
-    ile sarmalar. Boş veri veya rate-limit dışı hatalarda hemen
-    None/istisna döner (retry ile düzelmez)."""
+    """yfinance.Ticker(...).history çağrısını rate-limit için basit
+    retry/backoff ile sarmalar. Boş veri veya rate-limit dışı hatalarda
+    hemen None/istisna döner (retry ile düzelmez)."""
     last_err = None
-    for attempt in range(4):
+    for attempt in range(3):
         try:
             df = yf.Ticker(candidate).history(period=period, interval=interval, auto_adjust=False)
             if df is None or df.empty:
@@ -559,9 +401,7 @@ def _yf_history_with_retry(candidate: str, period: str, interval: str):
         except Exception as e:
             last_err = e
             if _is_rate_limit_text(str(e)):
-                # Backoff + jitter: art arda gelen istekler Yahoo'ya aynı
-                # anda toslamasın diye rastgele ek gecikme eklenir.
-                time.sleep(1.5 * (attempt + 1) + random.uniform(0, 1.5))
+                time.sleep(1.5 * (attempt + 1))
                 continue
             break
     return None, last_err
@@ -682,41 +522,15 @@ def fetch_bars_yfinance(user_symbol: str, interval: str, outputsize: int):
 # ANA fetch_bars FONKSİYONU
 # ----------------------------------------------------------------------------
 
-def _derive_gram_try_bars(source_symbol: str, interval: str, outputsize: int):
-    """XAUUSD veya XAGUSD gibi ons/USD fiyatını USDTRY ile çarpıp gram/TL'ye
-    çevirir. XAUTRYG (Gram Altın/TL) ve GMSTR (Gram Gümüş/TL) ortak mantığı."""
-    source_bars = fetch_bars(source_symbol, interval, outputsize)
-    usdtry_bars = fetch_bars("USDTRY", interval, outputsize)
-    usdtry_by_date = {b["datetime"]: b for b in usdtry_bars}
-
-    result = []
-    for sb in source_bars:
-        ub = usdtry_by_date.get(sb["datetime"])
-        if ub is None:
-            continue
-        sb_close = sb.get("close", (float(sb["high"]) + float(sb["low"])) / 2)
-        ub_close = ub.get("close", (float(ub["high"]) + float(ub["low"])) / 2)
-        result.append({
-            "datetime": sb["datetime"],
-            "high": (float(sb["high"]) / GRAMS_PER_TROY_OUNCE) * float(ub["high"]),
-            "low": (float(sb["low"]) / GRAMS_PER_TROY_OUNCE) * float(ub["low"]),
-            "close": (float(sb_close) / GRAMS_PER_TROY_OUNCE) * float(ub_close),
-        })
-
-    if not result:
-        raise ValueError(f"{source_symbol} ve USDTRY tarihleri eşleştirilemedi.")
-    return result
+GRAMS_PER_TROY_OUNCE = 31.1034768
 
 
 def fetch_bars(user_symbol: str, interval: str, outputsize: int):
     """
     Sıralama:
-      1) XAUTRYG/GLDTR -> XAUUSD ve USDTRY üzerinden TÜRETİLİR (Gram Altın/TL).
-         GMSTR -> XAGUSD ve USDTRY üzerinden TÜRETİLİR (Gram Gümüş/TL).
+      1) XAUTRYG -> XAUUSD ve USDTRY üzerinden TÜRETİLİR.
       2) XU100/XU030/XU500 -> doğrudan isyatirimhisse (İş Yatırım).
-      3) DXY/VIX/SPX/NDX/DJI/UKOIL gibi endeks/emtia aliasları kanonik
-         sembole çevrilir.
-      4) Diğer her şey -> önce Twelve Data; 'UPGRADE_REQUIRED' hatası
+      3) Diğer her şey -> önce Twelve Data; 'UPGRADE_REQUIRED' hatası
          alırsa (ücretsiz planda kapalı sembol) sırasıyla:
          MetalpriceAPI (sadece XAG/XPT/XPD için) -> yfinance denenir.
          (Stooq, sık başarısız olduğu ve rate-limit sorunları yarattığı
@@ -724,19 +538,34 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
     """
     normalized_input = user_symbol.strip().upper().replace(" ", "")
 
-    for canonical_name, (source_symbol, aliases) in GRAM_TRY_ALIASES.items():
-        if normalized_input in aliases:
-            return _derive_gram_try_bars(source_symbol, interval, outputsize)
+    if normalized_input in ("XAUTRYG", "GRAMALTIN"):
+        xau_bars = fetch_bars("XAUUSD", interval, outputsize)
+        usdtry_bars = fetch_bars("USDTRY", interval, outputsize)
+        usdtry_by_date = {b["datetime"]: b for b in usdtry_bars}
+
+        result = []
+        for xb in xau_bars:
+            ub = usdtry_by_date.get(xb["datetime"])
+            if ub is None:
+                continue
+            xb_close = xb.get("close", (float(xb["high"]) + float(xb["low"])) / 2)
+            ub_close = ub.get("close", (float(ub["high"]) + float(ub["low"])) / 2)
+            result.append({
+                "datetime": xb["datetime"],
+                "high": (float(xb["high"]) / GRAMS_PER_TROY_OUNCE) * float(ub["high"]),
+                "low": (float(xb["low"]) / GRAMS_PER_TROY_OUNCE) * float(ub["low"]),
+                "close": (float(xb_close) / GRAMS_PER_TROY_OUNCE) * float(ub_close),
+            })
+
+        if not result:
+            raise ValueError("XAUTRYG için XAUUSD ve USDTRY tarihleri eşleştirilemedi.")
+        return result
 
     if normalized_input in BIST_INDEX_ALIASES:
         return fetch_bars_bist_index(user_symbol, interval, outputsize)
 
-    # Endeks/emtia alias'larını kanonik sembole çevir (ör. "S&P500" -> "SPX")
-    canonical_index = INDEX_ALIASES.get(normalized_input)
-    effective_symbol = canonical_index if canonical_index is not None else user_symbol
-
     try:
-        return fetch_bars_twelvedata(effective_symbol, interval, outputsize)
+        return fetch_bars_twelvedata(user_symbol, interval, outputsize)
     except ValueError as e:
         if str(e) != "UPGRADE_REQUIRED":
             raise
@@ -746,14 +575,12 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
     fallback_sources = []
     if normalized_input in METALPRICEAPI_SYMBOL_MAP and METALPRICEAPI_KEY:
         fallback_sources.append(("MetalpriceAPI", fetch_bars_metalpriceapi))
-    if (canonical_index or normalized_input) in STOOQ_SYMBOL_MAP:
-        fallback_sources.append(("Stooq", fetch_bars_stooq))
     fallback_sources.append(("yfinance", fetch_bars_yfinance))
 
     errors = []
     for name, fetch_fn in fallback_sources:
         try:
-            return fetch_fn(effective_symbol, interval, outputsize)
+            return fetch_fn(user_symbol, interval, outputsize)
         except Exception as source_err:
             logger.info(f"🔄 '{user_symbol}' {name} başarısız oldu, sıradaki deneniyor... ({source_err})")
             errors.append(f"{name} ({source_err})")
@@ -920,11 +747,6 @@ CRYPTO_BASES = {
     "BNB", "AVAX", "LINK", "TRX", "SHIB", "ATOM", "UNI", "XLM", "ETC", "FIL",
     "APT", "ARB", "OP", "NEAR", "ICP", "AAVE", "SAND", "MANA", "ALGO", "VET",
 }
-
-# Endeks/emtia sembolleri (SPX, NDX, DJI, VIX, DXY, UKOIL) hafta sonu
-# hariç tutma / kripto ayrımı açısından "kripto olmayan" (forex gibi)
-# kabul edilir; zaten CRYPTO_BASES içinde yoklar, bu yüzden ek bir işlem
-# gerekmiyor.
 
 
 def _is_crypto_symbol(user_symbol: str) -> bool:
@@ -1137,9 +959,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✨ *Denge Aralığı Botu* ✨\n\n"
         "Bana bir enstrüman kodu gönder (örn: *BTCUSD*, *XAUUSD*, *XAGUSD*, *XPTUSD*, "
-        "*XPDUSD*, *EURUSD*, *DXY*, *VIX*, *SPX* (S&P500), *NDX*, *DJI*, *UKOIL*, "
-        "*XU100*, *XU030*, *XU500*, *XAUTRYG/GLDTR* (Gram Altın/TL), "
-        "*GMSTR* (Gram Gümüş/TL)).\n\n"
+        "*XPDUSD*, *EURUSD*, *DXY*, *VIX*, *XU100*, *XU030*, *XU500*, *XAUTRYG*).\n\n"
         "🕐 Günlük  📅 Haftalık  🗓️ Aylık  📈 6 Aylık  🏆 Yıllık\n"
         "için Denge (Medyan), Aritmetik Ortalama, Direnç 1/2 ve Destek 1/2 "
         "seviyelerini hesaplayayım.\n\n"
