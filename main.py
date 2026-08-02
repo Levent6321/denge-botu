@@ -72,6 +72,13 @@ MAX_SHORT_DAILY_BARS = 60
 MAX_LONG_WEEKLY_BARS = 84
 FOUR_HOUR_OUTPUTSIZE = 20
 
+# MetalpriceAPI ücretsiz planında tek istekte sorgulanabilecek en fazla gün
+# sayısı (bkz. _fetch_bars_metalpriceapi_uncached içindeki plan sınırları).
+# Modül seviyesine taşındı çünkü fetch_bars_metalpriceapi() de bu değere
+# bakarak, isteneni karşılayamayacağı belliyse erkenden hata fırlatıp bir
+# sonraki kaynağa (Stooq/yfinance) geçilmesini sağlıyor.
+METALPRICEAPI_FREE_PLAN_MAX_RANGE_DAYS = 4  # 5 günlük sınırın altında güvenli tampon
+
 PERIOD_NAMES = ["4 Saatlik", "Günlük", "Haftalık", "Aylık", "6 Aylık", "Yıllık"]
 
 TR_TZ = ZoneInfo("Europe/Istanbul")
@@ -331,7 +338,7 @@ def _fetch_bars_metalpriceapi_uncached(user_symbol: str, interval: str, outputsi
     #     sürecek geniş bir aralık gerektirir, 5 günlük pencereye asla
     #     sığmaz. Boşuna kota/ağ harcamamak için istek hiç atılmadan direkt
     #     hata döndürülür; sıradaki kaynağa (Stooq) geçilir.
-    FREE_PLAN_MAX_RANGE_DAYS = 4  # 5 günlük sınırın altında güvenli tampon
+    FREE_PLAN_MAX_RANGE_DAYS = METALPRICEAPI_FREE_PLAN_MAX_RANGE_DAYS
 
     if interval == "1week":
         raise ValueError(
@@ -385,7 +392,27 @@ def _fetch_bars_metalpriceapi_uncached(user_symbol: str, interval: str, outputsi
 
 
 def fetch_bars_metalpriceapi(user_symbol: str, interval: str, outputsize: int):
-    """MetalpriceAPI çağrısını önbellekle sarmalar (100 istek/ay kotasını korumak için)."""
+    """MetalpriceAPI çağrısını önbellekle sarmalar (100 istek/ay kotasını korumak için).
+
+    DÜZELTME: MetalpriceAPI ücretsiz planı bir istekte en fazla
+    ~METALPRICEAPI_FREE_PLAN_MAX_RANGE_DAYS gün verebiliyor. Daha önce bu
+    fonksiyon `outputsize` ne olursa olsun (ör. Haftalık/Aylık için istenen
+    30-60 gün) "başarıyla" birkaç barlık eksik veri döndürüyordu; fetch_bars()
+    de bunu "kaynak başarılı oldu" sayıp Stooq/yfinance'e hiç geçmiyordu.
+    Sonuç: Haftalık ve Aylık, aynı dar 3-4 günlük pencereden hesaplandığı
+    için birbirinin birebir kopyası çıkıyordu.
+    Bu yüzden istenen outputsize, kaynağın gerçekten karşılayabileceğinden
+    büyükse, veri çekmeyi hiç denemeden erken hata fırlatıp bir sonraki
+    kaynağa (Stooq/yfinance) geçilmesini sağlıyoruz.
+    """
+    if outputsize > METALPRICEAPI_FREE_PLAN_MAX_RANGE_DAYS + 1:
+        raise ValueError(
+            f"MetalpriceAPI ücretsiz planı tek istekte en fazla "
+            f"~{METALPRICEAPI_FREE_PLAN_MAX_RANGE_DAYS} günlük veri "
+            f"verebiliyor; istenen {outputsize} gün için yetersiz "
+            f"(Haftalık/Aylık gibi daha uzun geçmiş gerektiren periyotlar "
+            f"için bu kaynak atlanıp sıradakine geçilecek)."
+        )
     cache_key = f"metalpriceapi:{user_symbol.strip().upper()}:{interval}:{outputsize}"
     return _cached_fetch(cache_key, lambda: _fetch_bars_metalpriceapi_uncached(user_symbol, interval, outputsize))
 
@@ -853,6 +880,45 @@ def _levels_from_bars(bars, birim: str = "gün") -> dict:
     if not bars:
         raise ValueError("bu dönem henüz tamamlanmamış veya veri yok")
 
+    # AYKIRI DEĞER (BAD TICK) KORUMASI: bazı yedek kaynaklar (özellikle
+    # yfinance üzerinden çekilen vadeli işlem verisi - kontrat geçişleri,
+    # ara sıra bozuk tick'ler vb.) gerçekçi olmayan şekilde sıçramış tekil
+    # barlar döndürebiliyor. Tek bir böyle bar bile range/median hesabını
+    # (dolayısıyla Direnç/Destek seviyelerini) komple anlamsız hale
+    # getirebiliyor.
+    #
+    # Sabit bir çarpan (ör. "medyanın 2 katından fazlası atılsın") yeterince
+    # sağlam değil: gerçek bir bad tick tam sınırın hemen üstünde/altında
+    # kalıp yakalanmayabiliyor. Bunun yerine MAD (Medyan Mutlak Sapma)
+    # tabanlı, verinin KENDİ doğal oynaklığına göre uyarlanan bir eşik
+    # kullanılıyor: normal dağılımla tutarlı olacak şekilde ölçeklenmiş
+    # MAD'in 6 katından daha fazla sapan barlar atılıyor. Bu eşik,
+    # gerçek trend/oynaklık dönemlerini (ör. fiyatın kademeli %40 artması)
+    # yanlışlıkla elemeyecek kadar geniş, ama tek seferlik aşırı sıçramaları
+    # (ör. gerçek fiyatın ~2 katı bir bad tick) yakalayacak kadar sıkı.
+    # En az 5 bar varsa uygulanır (az sayıda veriyle MAD güvenilir olmaz);
+    # filtre barların yarısından fazlasını elerse (veri gerçekten aşırı
+    # oynaksa) orijinal listeye geri dönülür.
+    if len(bars) >= 5:
+        closes_for_filter = [_bar_close(b) for b in bars]
+        median_close_for_filter = statistics.median(closes_for_filter)
+        abs_devs = [abs(c - median_close_for_filter) for c in closes_for_filter]
+        mad = statistics.median(abs_devs)
+        if mad > 0:
+            scaled_mad = mad * 1.4826  # normal dağılıma göre ölçeklenmiş MAD
+            threshold = 6 * scaled_mad
+
+            def _is_plausible(bar) -> bool:
+                try:
+                    c = _bar_close(bar)
+                except Exception:
+                    return True
+                return abs(c - median_close_for_filter) <= threshold
+
+            filtered_bars = [b for b in bars if _is_plausible(b)]
+            if filtered_bars and len(filtered_bars) >= max(3, len(bars) // 2):
+                bars = filtered_bars
+
     values = []
     for bar in bars:
         h = round(float(bar["high"]), 4)
@@ -1091,7 +1157,7 @@ def format_period_block(period_name: str, result: dict) -> str:
         f"{icon} <b>{html.escape(period_name)}</b>",
         f"<i>{birim_etiketi}</i>",
         f"<i>📆 Geçerlilik: {tarih_araligi}</i>",
-        f"<pre>{html.escape(table)}</pre>",
+        f"<pre><code>{html.escape(table)}</code></pre>",
     ]
 
     if result["mod"]:
