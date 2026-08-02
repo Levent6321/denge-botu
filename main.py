@@ -1,5 +1,5 @@
 """
-DENGE ARALIĞI TELEGRAM BOTU (2 Kaynaklı Hibrit Model)
+DENGE ARALIĞI TELEGRAM BOTU (2 Kaynaklı Hibrit Model - Stooq Kaldırıldı)
 ============================================================================
 1) Twelve Data      -> BTCUSD, XAUUSD, EURUSD gibi standart forex/kripto/emtia
 2) isyatirimhisse    -> XU100, XU030, XU500 gibi BIST endeksleri (İş Yatırım)
@@ -29,7 +29,8 @@ try:
     import yfinance as yf
 except ImportError:
     yf = None
-  # ----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
 # AYARLAR
 # ----------------------------------------------------------------------------
 
@@ -78,7 +79,8 @@ def _is_rate_limit_text(text: str) -> bool:
     return any(phrase in lowered for phrase in [
         "too many requests", "rate limit", "rate-limited", "429",
     ])
-  # ----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
 # SEMBOL NORMALİZASYON
 # ----------------------------------------------------------------------------
 
@@ -183,7 +185,8 @@ def fetch_bars_bist_index(user_symbol: str, interval: str, outputsize: int):
     if not bars: raise ValueError(f"'{user_symbol}' için ayrıştırılabilir veri bulunamadı.")
     bars.sort(key=lambda b: b["datetime"])
     return bars[-outputsize:] if len(bars) > outputsize else bars
-  # ----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
 # VERİ ÇEKME - YEDEK KAYNAK: MetalpriceAPI
 # ----------------------------------------------------------------------------
 
@@ -297,7 +300,8 @@ def _fetch_bars_yfinance_uncached(user_symbol: str, interval: str, outputsize: i
 def fetch_bars_yfinance(user_symbol: str, interval: str, outputsize: int):
     cache_key = f"yfinance:{user_symbol.strip().upper()}:{interval}:{outputsize}"
     return _cached_fetch(cache_key, lambda: _fetch_bars_yfinance_uncached(user_symbol, interval, outputsize))
-  # ----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
 # ANA fetch_bars FONKSİYONU
 # ----------------------------------------------------------------------------
 GRAMS_PER_TROY_OUNCE = 31.1034768
@@ -406,7 +410,8 @@ def get_current_half_year_range(today: date):
 
 def get_current_year_range(today: date):
     return date(today.year, 1, 1), date(today.year, 12, 31)
-  # ----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
 # HESAPLAMA VE BİRLEŞTİRME
 # ----------------------------------------------------------------------------
 def _parse_bar_date(bar: dict) -> date:
@@ -576,4 +581,36 @@ def calculate_all_periods(user_symbol: str) -> dict:
             results["Yıllık"] = _levels_from_bars(_filter_by_range(weekly_bars, start, end), birim="hafta")
             hedef_start, hedef_end = get_current_year_range(today)
             results["Yıllık"]["baslangic"] = hedef_start.isoformat()
-           
+            results["Yıllık"]["bitis"] = hedef_end.isoformat()
+        except Exception as e: results["Yıllık"] = {"hata": str(e)}
+
+    results["_guncel_fiyat"] = guncel_fiyat
+    results["_guncel_fiyat_zaman"] = guncel_fiyat_zaman
+    return results
+
+# ----------------------------------------------------------------------------
+# TELEGRAM BOTU
+# ----------------------------------------------------------------------------
+
+PERIOD_ICONS = {
+    "4 Saatlik": "🕓",
+    "Günlük": "🕐",
+    "Haftalık": "📅",
+    "Aylık": "🗓️",
+    "6 Aylık": "📈",
+    "Yıllık": "🏆",
+}
+
+CONFIRMATION_NOTES = {
+    "4 Saatlik": "2 adet 30 dakikalık kapanış",
+    "Günlük": "2 adet 1 saatlik kapanış",
+    "Haftalık": "2 adet 4 saatlik kapanış",
+    "Aylık": "2 adet günlük kapanış",
+    "6 Aylık": "2 adet aylık kapanış",
+    "Yıllık": "2 adet 6 aylık kapanış",
+}
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "✨ *Denge Aralığı Botu* ✨\n\n"
+        "Bana bir enstrüman kodu gönder (örn: *BTCUSD*, *XAUUSD
