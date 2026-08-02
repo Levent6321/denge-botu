@@ -316,11 +316,19 @@ def _fetch_bars_metalpriceapi_uncached(user_symbol: str, interval: str, outputsi
         raise ValueError(f"MetalpriceAPI '{user_symbol}' sembolünü desteklemiyor.")
 
     today = datetime.now(TR_TZ).date()
-    # 365 gün, API'nin timeframe endpoint'indeki maksimum aralık.
+    # ÖNEMLİ: MetalpriceAPI ücretsiz planı 30 günden eski tarihli sorguları
+    # reddediyor ("Querying older than 30 days requires a paid plan").
+    # Bu yüzden 365 gün yerine, güvenli bir tampon bırakarak 28 günle
+    # sınırlıyoruz. Bu, Günlük/Haftalık ve genelde Aylık'ın büyük kısmını
+    # karşılar; 6 Aylık/Yıllık gibi çok daha eski veri gerektiren periyotlar
+    # bu kaynaktan hiçbir zaman tam dolduramaz (ücretli plan gerektirir),
+    # ama en azından çirkin bir API hatası yerine düzgün "veri yok" mesajı
+    # gösterilir.
+    FREE_PLAN_MAX_LOOKBACK_DAYS = 28
     if interval == "1week":
-        days_needed = min(outputsize * 7 + 14, 365)
+        days_needed = min(outputsize * 7 + 14, FREE_PLAN_MAX_LOOKBACK_DAYS)
     else:
-        days_needed = min(outputsize + 14, 365)
+        days_needed = min(outputsize + 14, FREE_PLAN_MAX_LOOKBACK_DAYS)
     start_date = today - timedelta(days=days_needed)
     # Free planda güncel günün verisi henüz gelmemiş olabilir (bir gün gecikmeli).
     end_date = today - timedelta(days=1)
