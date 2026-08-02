@@ -1,24 +1,15 @@
 """
-DENGE ARALIĞI TELEGRAM BOTU (3 Kaynaklı Hibrit Model)
+DENGE ARALIĞI TELEGRAM BOTU (2 Kaynaklı Hibrit Model - Stooq Kaldırıldı)
 ============================================================================
 1) Twelve Data      -> BTCUSD, XAUUSD, EURUSD gibi standart forex/kripto/emtia
 2) isyatirimhisse    -> XU100, XU030, XU500 gibi BIST endeksleri (İş Yatırım)
-3) MetalpriceAPI / yfinance (yedek) -> Twelve Data'da ücretsiz planda kapalı
-                        olan XAGUSD, XPTUSD, XPDUSD, VIX, DXY gibi semboller
-                        için denenir (garantisi yoktur).
-XAUTRYG (Gram Altın/TL) ise XAUUSD ve USDTRY üzerinden TÜRETİLİR.
-
-GÜNCELLEME NOTU (2. revizyon):
-  - Stooq, sık "Too Many Requests" hatası verdiği ve XAG/XPT/XPD gibi
-    semboller için genelde başarısız olduğu için yedek zincirinden
-    ÇIKARILDI. Artık sıralama: Twelve Data -> MetalpriceAPI (varsa) ->
-    yfinance.
-  - yfinance artık "4 Saatlik" (4h) aralığını da destekliyor: doğrudan
-    4 saatlik veri sağlamadığı için 60 dakikalık barlar çekilip pandas ile
-    4 saatlik OHLC'ye yeniden örnekleniyor (resample). Bu sayede
-    XAGUSD/XPTUSD/XPDUSD gibi Twelve Data'da kapalı sembollerde de
-    "4 Saatlik" bloğu artık hesaplanabiliyor (önceden hep hata veriyordu).
-  - Önceki notlar (User-Agent, retry/backoff, 5-15 dk önbellek) korunuyor.
+3) MetalpriceAPI     -> Twelve Data'da kapalı olan XAGUSD, XPTUSD, XPDUSD için 
+                        (API key ile, scraping değil, Cloudflare'e takılmaz)
+4) yfinance (yedek)  -> Son çare olarak (XAG/XPT/XPD için PA=F, SI=F gibi vadeli 
+                        işlem sembollerine düşer)
+                        
+GÜNCELLEME NOTU: Stooq tamamen kaldırıldı (Cloudflare bot koruması sebebiyle).
+yfinance rate-limit'i azaltmak için her istek öncesi 1.5 saniye bekleme eklendi.
 """
 
 import os
@@ -44,11 +35,6 @@ try:
 except ImportError:
     yf = None
 
-try:
-    import pandas as pd
-except ImportError:
-    pd = None
-
 # ----------------------------------------------------------------------------
 # AYARLAR
 # ----------------------------------------------------------------------------
@@ -57,10 +43,6 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
-# metalpriceapi.com - XAGUSD/XPTUSD/XPDUSD için Stooq/Yahoo'dan ÖNCE denenen,
-# API key ile çalışan (scraping olmayan) stabil ücretsiz kaynak.
-# ÖNEMLİ: Bu key'i asla kod içine yazıp commit ETMEYİN (repo public!).
-# Railway/Heroku ortam değişkenlerine METALPRICEAPI_KEY adıyla ekleyin.
 METALPRICEAPI_KEY = os.getenv("METALPRICEAPI_KEY")
 
 TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
@@ -74,16 +56,6 @@ PERIOD_NAMES = ["4 Saatlik", "Günlük", "Haftalık", "Aylık", "6 Aylık", "Yı
 
 TR_TZ = ZoneInfo("Europe/Istanbul")
 
-# Yahoo gibi siteler User-Agent'sız isteklerde daha kolay rate-limit
-# uyguluyor; gerçek bir tarayıcı gibi görünmek için ortak header seti.
-BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9,tr;q=0.8",
-}
-
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -95,8 +67,7 @@ logger = logging.getLogger(__name__)
 # BASİT BELLEK-İÇİ ÖNBELLEK (rate limit'i azaltmak için)
 # ----------------------------------------------------------------------------
 _CACHE: dict[str, tuple[float, object]] = {}
-_CACHE_TTL_SECONDS = 900  # 15 dakika (Yahoo rate-limit riskini azaltmak için)
-
+_CACHE_TTL_SECONDS = 900  # 15 dakika
 
 def _cached_fetch(cache_key: str, fetch_fn):
     now = time.time()
@@ -122,7 +93,6 @@ def _is_rate_limit_text(text: str) -> bool:
 # ----------------------------------------------------------------------------
 
 def normalize_symbol(user_symbol: str) -> str:
-    """'BTCUSD' -> 'BTC/USD', 'XAUUSD' -> 'XAU/USD' gibi Twelve Data formatına çevirir."""
     s = user_symbol.strip().upper().replace(" ", "")
     if "/" in s:
         return s
@@ -137,9 +107,8 @@ def normalize_symbol(user_symbol: str) -> str:
 # ----------------------------------------------------------------------------
 
 def fetch_bars_twelvedata(user_symbol: str, interval: str, outputsize: int):
-    """Twelve Data'dan belirtilen aralıkta son `outputsize` mumu çeker."""
     if not TWELVE_DATA_API_KEY:
-        raise ValueError("TWELVE_DATA_API_KEY tanımlı değil. Ortam değişkenlerini kontrol edin.")
+        raise ValueError("TWELVE_DATA_API_KEY tanımlı değil.")
 
     symbol = normalize_symbol(user_symbol)
     params = {
@@ -162,13 +131,13 @@ def fetch_bars_twelvedata(user_symbol: str, interval: str, outputsize: int):
         raise ValueError(msg)
 
     if "values" not in data:
-        raise ValueError(f"'{symbol}' için veri bulunamadı. Sembolü kontrol edin (örn: BTCUSD, XAUUSD, EURUSD).")
+        raise ValueError(f"'{symbol}' için veri bulunamadı.")
 
     return data["values"]
 
 
 # ----------------------------------------------------------------------------
-# VERİ ÇEKME - BIST ENDEKSLERİ: isyatirimhisse (İş Yatırım)
+# VERİ ÇEKME - BIST ENDEKSLERİ: isyatirimhisse
 # ----------------------------------------------------------------------------
 
 BIST_INDEX_ALIASES = {
@@ -176,7 +145,6 @@ BIST_INDEX_ALIASES = {
     "XU030": "XU030", "XU30": "XU030", "BIST30": "XU030",
     "XU500": "XU500", "BIST500": "XU500",
 }
-
 
 def _normalize_date_str(raw) -> str:
     raw = str(raw).strip()
@@ -193,16 +161,13 @@ def _normalize_date_str(raw) -> str:
                 return f"{yyyy}-{aa.zfill(2)}-{gg.zfill(2)}"
     raise ValueError(f"Tarih formatı tanınamadı: {raw}")
 
-
 def fetch_bars_bist_index(user_symbol: str, interval: str, outputsize: int):
     if interval == "4h":
         raise ValueError("İş Yatırım kaynağında 4 saatlik veri yok.")
-
     if isyatirimhisse is None:
         raise ValueError("isyatirimhisse kütüphanesi kurulu değil.")
 
     index_code = BIST_INDEX_ALIASES[user_symbol.strip().upper().replace(" ", "")]
-
     today = datetime.now(TR_TZ).date()
     start = today - timedelta(days=800)
 
@@ -224,7 +189,7 @@ def fetch_bars_bist_index(user_symbol: str, interval: str, outputsize: int):
     )
 
     if date_col is None or (close_col is None and (high_col is None or low_col is None)):
-        raise ValueError(f"İş Yatırım verisi beklenmeyen formatta (sütunlar: {list(df.columns)}).")
+        raise ValueError(f"İş Yatırım verisi beklenmeyen formatta.")
 
     bars = []
     for _, row in df.iterrows():
@@ -252,17 +217,15 @@ def fetch_bars_bist_index(user_symbol: str, interval: str, outputsize: int):
 
 
 # ----------------------------------------------------------------------------
-# VERİ ÇEKME - YEDEK KAYNAK: MetalpriceAPI (sadece XAG/XPT/XPD için)
+# VERİ ÇEKME - YEDEK KAYNAK: MetalpriceAPI
 # ----------------------------------------------------------------------------
 
 METALPRICEAPI_URL = "https://api.metalpriceapi.com/v1/timeframe"
-
 METALPRICEAPI_SYMBOL_MAP = {
-    "XAGUSD": "XAG",  # Gümüş
-    "XPTUSD": "XPT",  # Platin
-    "XPDUSD": "XPD",  # Paladyum
+    "XAGUSD": "XAG",
+    "XPTUSD": "XPT",
+    "XPDUSD": "XPD",
 }
-
 
 def _fetch_bars_metalpriceapi_uncached(user_symbol: str, interval: str, outputsize: int):
     if interval == "4h":
@@ -276,19 +239,8 @@ def _fetch_bars_metalpriceapi_uncached(user_symbol: str, interval: str, outputsi
         raise ValueError(f"MetalpriceAPI '{user_symbol}' sembolünü desteklemiyor.")
 
     today = datetime.now(TR_TZ).date()
-    if interval == "1week":
-        days_needed = min(outputsize * 7 + 14, 365)
-    else:
-        days_needed = min(outputsize + 14, 365)
-
-    # Ücretsiz plan sadece son 30 günü destekliyor; daha eskisi 'paid plan'
-    # hatası veriyor. Bu durumda API'ye hiç istek atmadan erken çıkıyoruz.
-    if days_needed > 30:
-        raise ValueError(
-            "MetalpriceAPI ücretsiz planı yalnızca son 30 günü destekliyor "
-            f"(bu istek {days_needed} gün geriye gidiyor)."
-        )
-
+    # NOT: MetalpriceAPI ücretsiz planda sadece 30 günlük veri sağlar.
+    days_needed = min(outputsize * 7 + 14, 30) 
     start_date = today - timedelta(days=days_needed)
     end_date = today - timedelta(days=1)
 
@@ -328,7 +280,6 @@ def _fetch_bars_metalpriceapi_uncached(user_symbol: str, interval: str, outputsi
 
     return daily_bars[-outputsize:] if len(daily_bars) > outputsize else daily_bars
 
-
 def fetch_bars_metalpriceapi(user_symbol: str, interval: str, outputsize: int):
     cache_key = f"metalpriceapi:{user_symbol.strip().upper()}:{interval}:{outputsize}"
     return _cached_fetch(cache_key, lambda: _fetch_bars_metalpriceapi_uncached(user_symbol, interval, outputsize))
@@ -337,28 +288,15 @@ def fetch_bars_metalpriceapi(user_symbol: str, interval: str, outputsize: int):
 # ----------------------------------------------------------------------------
 # VERİ ÇEKME - 2. YEDEK KAYNAK: Yahoo Finance (yfinance)
 # ----------------------------------------------------------------------------
-# Twelve Data (ve varsa MetalpriceAPI) başarısız olursa denenir.
-# Günlük/Haftalık için doğrudan yfinance verisi kullanılır.
-# 4 Saatlik için yfinance'te native "4h" aralığı YOK; bu yüzden 60 dakikalık
-# barlar çekilip pandas ile 4 saatlik OHLC'ye yeniden örnekleniyor.
 
 YFINANCE_INTERVAL_MAP = {"1day": "1d", "1week": "1wk"}
-
 YFINANCE_FUTURES_FALLBACK = {
-    "XAGUSD": "SI=F",   # Gümüş vadeli
-    "XPTUSD": "PL=F",   # Platin vadeli
-    "XPDUSD": "PA=F",   # Paladyum vadeli
+    "XAGUSD": "SI=F",
+    "XPTUSD": "PL=F",
+    "XPDUSD": "PA=F",
 }
 
-# NOT: yfinance'e dışarıdan sade bir requests.Session vermek, kütüphanenin
-# kendi iç kimlik doğrulama (crumb/cookie) mekanizmasını devre dışı bırakıp
-# TÜM istekleri "Too Many Requests" gibi görünen kalıcı bir hataya
-# sokabiliyor. Bu yüzden burada session'ı KASITLI OLARAK yfinance'in kendi
-# varsayılan yönetimine bırakıyoruz (session parametresi vermiyoruz).
-
-
 def _normalize_yfinance_symbol(user_symbol: str) -> str:
-    """'BTCUSD' -> 'BTC-USD', 'XAUUSD' -> 'XAUUSD=X' gibi Yahoo Finance formatına çevirir."""
     s = user_symbol.strip().upper().replace(" ", "").replace("/", "")
     if len(s) > 3:
         base, quote = s[:-3], s[-3:]
@@ -366,88 +304,66 @@ def _normalize_yfinance_symbol(user_symbol: str) -> str:
             return f"{base}-{quote}"
     return f"{s}=X"
 
-
-def _yfinance_candidates(user_symbol: str) -> list:
-    """Denenecek Yahoo sembollerini önem sırasına göre döndürür.
-
-    XAG/XPT/XPD gibi metaller için Yahoo'da doğrudan bir forex sembolü
-    (ör. 'XAGUSD=X') hiçbir zaman bulunmuyor ('possibly delisted' hatası
-    kesin geliyor); bu yüzden bu semboller için normalize edilmiş forex
-    formatını hiç denemeden doğrudan bilinen vadeli işlem sembolünü
-    (ör. 'SI=F') ilk sıraya koyuyoruz. Diğer tüm semboller için önce
-    normalize edilmiş format, ardından (varsa) vadeli işlem yedeği denenir.
-    """
-    normalized_input = user_symbol.strip().upper().replace(" ", "")
-    futures_symbol = YFINANCE_FUTURES_FALLBACK.get(normalized_input)
-
-    if futures_symbol is not None:
-        # Bu sembollerde forex tickerı hiç çalışmadığı için doğrudan vadeliyle başla.
-        return [futures_symbol]
-
-    return [_normalize_yfinance_symbol(user_symbol)]
-
-
-def _yf_history_with_retry(candidate: str, period: str, interval: str):
-    """yfinance.Ticker(...).history çağrısını rate-limit için basit
-    retry/backoff ile sarmalar. Boş veri veya rate-limit dışı hatalarda
-    hemen None/istisna döner (retry ile düzelmez)."""
-    last_err = None
-    for attempt in range(3):
-        try:
-            df = yf.Ticker(candidate).history(period=period, interval=interval, auto_adjust=False)
-            if df is None or df.empty:
-                return None, ValueError(f"'{candidate}' için veri dönmedi.")
-            return df, None
-        except Exception as e:
-            last_err = e
-            if _is_rate_limit_text(str(e)):
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            break
-    return None, last_err
-
-
 def _fetch_bars_yfinance_uncached(user_symbol: str, interval: str, outputsize: int):
-    if yf is None:
-        raise ValueError("yfinance kütüphanesi kurulu değil (pip install yfinance).")
-
-    if interval == "4h":
-        return _fetch_4h_bars_yfinance(user_symbol, outputsize)
-
     if interval not in YFINANCE_INTERVAL_MAP:
-        raise ValueError(f"yfinance kaynağında '{interval}' aralığı desteklenmiyor.")
+        raise ValueError("yfinance kaynağında bu aralık (4 saatlik) desteklenmiyor.")
+    if yf is None:
+        raise ValueError("yfinance kütüphanesi kurulu değil.")
 
     yf_interval = YFINANCE_INTERVAL_MAP[interval]
-    candidates = _yfinance_candidates(user_symbol)
+    normalized_input = user_symbol.strip().upper().replace(" ", "")
+
+    candidates = [_normalize_yfinance_symbol(user_symbol)]
+    if normalized_input in YFINANCE_FUTURES_FALLBACK:
+        candidates.append(YFINANCE_FUTURES_FALLBACK[normalized_input])
 
     days_multiplier = 7 if yf_interval == "1wk" else 2
     period_days = min(outputsize * days_multiplier + 30, 3650)
 
     last_err = None
     rate_limited = False
+    max_attempts = 3
+
     for candidate in candidates:
-        df, err = _yf_history_with_retry(candidate, f"{period_days}d", yf_interval)
-        if err is not None:
-            last_err = err
-            if _is_rate_limit_text(str(err)):
-                rate_limited = True
-            continue
-
-        bars = []
-        for idx, row in df.iterrows():
+        for attempt in range(max_attempts):
             try:
-                bars.append({
-                    "datetime": idx.strftime("%Y-%m-%d"),
-                    "high": float(row["High"]),
-                    "low": float(row["Low"]),
-                    "close": float(row["Close"]),
-                })
-            except (TypeError, ValueError):
-                continue
+                # === RATE-LIMIT KORUMASI: Her istekten önce 1.5 saniye bekle ===
+                time.sleep(1.5)
+                
+                df = yf.Ticker(candidate).history(
+                    period=f"{period_days}d",
+                    interval=yf_interval,
+                    auto_adjust=False,
+                )
+                if df is None or df.empty:
+                    last_err = ValueError(f"'{candidate}' için veri dönmedi.")
+                    break
 
-        if bars:
-            return bars[-outputsize:] if len(bars) > outputsize else bars
-        last_err = ValueError(f"'{candidate}' için ayrıştırılabilir veri yok.")
+                bars = []
+                for idx, row in df.iterrows():
+                    try:
+                        bars.append({
+                            "datetime": idx.strftime("%Y-%m-%d"),
+                            "high": float(row["High"]),
+                            "low": float(row["Low"]),
+                            "close": float(row["Close"]),
+                        })
+                    except (TypeError, ValueError):
+                        continue
+
+                if not bars:
+                    last_err = ValueError(f"'{candidate}' için ayrıştırılabilir veri yok.")
+                    break
+
+                return bars[-outputsize:] if len(bars) > outputsize else bars
+
+            except Exception as e:
+                last_err = e
+                if _is_rate_limit_text(str(e)):
+                    rate_limited = True
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                break
 
     if rate_limited:
         raise ValueError(
@@ -456,64 +372,7 @@ def _fetch_bars_yfinance_uncached(user_symbol: str, interval: str, outputsize: i
         )
     raise ValueError(f"yfinance: '{user_symbol}' için veri alınamadı ({last_err}).")
 
-
-def _fetch_4h_bars_yfinance(user_symbol: str, outputsize: int):
-    """yfinance'te native 4 saatlik interval olmadığı için 60 dakikalık
-    barlar çekilip 4 saatlik OHLC'ye yeniden örnekleniyor (resample).
-    yfinance 60m veriyi en fazla ~730 gün geriye sunar; bu botun ihtiyacı
-    (son birkaç 4 saatlik mum) için fazlasıyla yeterli, bu yüzden kısa bir
-    period (ör. 10 gün) yeterli."""
-    if pd is None:
-        raise ValueError("pandas kurulu değil, 4 saatlik yeniden örnekleme (resample) yapılamıyor.")
-
-    candidates = _yfinance_candidates(user_symbol)
-
-    last_err = None
-    rate_limited = False
-    for candidate in candidates:
-        df, err = _yf_history_with_retry(candidate, "10d", "60m")
-        if err is not None:
-            last_err = err
-            if _is_rate_limit_text(str(err)):
-                rate_limited = True
-            continue
-
-        try:
-            resampled = df.resample("4h", label="right", closed="right").agg({
-                "High": "max",
-                "Low": "min",
-                "Close": "last",
-            }).dropna(how="all")
-        except Exception as e:
-            last_err = ValueError(f"'{candidate}' 4 saatlik yeniden örnekleme başarısız: {e}")
-            continue
-
-        bars = []
-        for idx, row in resampled.iterrows():
-            try:
-                bars.append({
-                    "datetime": idx.strftime("%Y-%m-%d %H:%M:%S"),
-                    "high": float(row["High"]),
-                    "low": float(row["Low"]),
-                    "close": float(row["Close"]),
-                })
-            except (TypeError, ValueError):
-                continue
-
-        if bars:
-            return bars[-outputsize:] if len(bars) > outputsize else bars
-        last_err = ValueError(f"'{candidate}' için 4 saatlik bar üretilemedi.")
-
-    if rate_limited:
-        raise ValueError(
-            "Yahoo Finance şu anda istek limiti uyguluyor (Too Many Requests). "
-            "Lütfen birkaç dakika sonra tekrar deneyin."
-        )
-    raise ValueError(f"yfinance: '{user_symbol}' için 4 saatlik veri alınamadı ({last_err}).")
-
-
 def fetch_bars_yfinance(user_symbol: str, interval: str, outputsize: int):
-    """yfinance çağrısını kısa süreli önbellekle sarmalar (rate limit'i azaltmak için)."""
     cache_key = f"yfinance:{user_symbol.strip().upper()}:{interval}:{outputsize}"
     return _cached_fetch(cache_key, lambda: _fetch_bars_yfinance_uncached(user_symbol, interval, outputsize))
 
@@ -524,18 +383,7 @@ def fetch_bars_yfinance(user_symbol: str, interval: str, outputsize: int):
 
 GRAMS_PER_TROY_OUNCE = 31.1034768
 
-
 def fetch_bars(user_symbol: str, interval: str, outputsize: int):
-    """
-    Sıralama:
-      1) XAUTRYG -> XAUUSD ve USDTRY üzerinden TÜRETİLİR.
-      2) XU100/XU030/XU500 -> doğrudan isyatirimhisse (İş Yatırım).
-      3) Diğer her şey -> önce Twelve Data; 'UPGRADE_REQUIRED' hatası
-         alırsa (ücretsiz planda kapalı sembol) sırasıyla:
-         MetalpriceAPI (sadece XAG/XPT/XPD için) -> yfinance denenir.
-         (Stooq, sık başarısız olduğu ve rate-limit sorunları yarattığı
-         için zincirden çıkarıldı.)
-    """
     normalized_input = user_symbol.strip().upper().replace(" ", "")
 
     if normalized_input in ("XAUTRYG", "GRAMALTIN"):
@@ -575,6 +423,9 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
     fallback_sources = []
     if normalized_input in METALPRICEAPI_SYMBOL_MAP and METALPRICEAPI_KEY:
         fallback_sources.append(("MetalpriceAPI", fetch_bars_metalpriceapi))
+    
+    # NOT: Stooq tamamen kaldırıldı (Cloudflare bot koruması sebebiyle çalışmıyor).
+    # Son çare olarak yfinance kullanılıyor.
     fallback_sources.append(("yfinance", fetch_bars_yfinance))
 
     errors = []
@@ -591,27 +442,23 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
 
 
 # ----------------------------------------------------------------------------
-# DÖNEM SINIRLARI (son TAMAMLANMIŞ hafta / ay / yarıyıl / yıl)
+# DÖNEM SINIRLARI
 # ----------------------------------------------------------------------------
 
 def get_last_completed_week_range(today: date, is_crypto: bool = False):
     weekday = today.weekday()
-
     if is_crypto:
         this_monday = today - timedelta(days=weekday)
         last_monday = this_monday - timedelta(days=7)
         last_sunday = last_monday + timedelta(days=6)
         return last_monday, last_sunday
-
     if weekday >= 5:
         week_monday = today - timedelta(days=weekday)
     else:
         this_monday = today - timedelta(days=weekday)
         week_monday = this_monday - timedelta(days=7)
-
     week_friday = week_monday + timedelta(days=4)
     return week_monday, week_friday
-
 
 def get_last_completed_month_range(today: date):
     first_of_this_month = today.replace(day=1)
@@ -619,22 +466,18 @@ def get_last_completed_month_range(today: date):
     first_day_prev_month = last_day_prev_month.replace(day=1)
     return first_day_prev_month, last_day_prev_month
 
-
 def get_last_completed_half_year_range(today: date):
     year = today.year
     if today.month <= 6:
         return date(year - 1, 7, 1), date(year - 1, 12, 31)
     return date(year, 1, 1), date(year, 6, 30)
 
-
 def get_last_completed_year_range(today: date):
     last_year = today.year - 1
     return date(last_year, 1, 1), date(last_year, 12, 31)
 
-
 def get_current_day_range(today: date):
     return today, today
-
 
 def get_current_week_range(today: date, is_crypto: bool = False):
     weekday = today.weekday()
@@ -642,16 +485,13 @@ def get_current_week_range(today: date, is_crypto: bool = False):
         monday = today - timedelta(days=weekday)
         sunday = monday + timedelta(days=6)
         return monday, sunday
-
     if weekday >= 5:
         next_monday = today - timedelta(days=weekday) + timedelta(days=7)
         next_friday = next_monday + timedelta(days=4)
         return next_monday, next_friday
-
     this_monday = today - timedelta(days=weekday)
     this_friday = this_monday + timedelta(days=4)
     return this_monday, this_friday
-
 
 def _next_trading_day(today: date, is_crypto: bool = False) -> date:
     if is_crypto:
@@ -660,7 +500,6 @@ def _next_trading_day(today: date, is_crypto: bool = False) -> date:
     while d.weekday() >= 5:
         d += timedelta(days=1)
     return d
-
 
 def get_current_month_range(today: date):
     first_of_month = today.replace(day=1)
@@ -671,13 +510,11 @@ def get_current_month_range(today: date):
     last_of_month = next_month_first - timedelta(days=1)
     return first_of_month, last_of_month
 
-
 def get_current_half_year_range(today: date):
     year = today.year
     if today.month <= 6:
         return date(year, 1, 1), date(year, 6, 30)
     return date(year, 7, 1), date(year, 12, 31)
-
 
 def get_current_year_range(today: date):
     return date(today.year, 1, 1), date(today.year, 12, 31)
@@ -690,17 +527,14 @@ def get_current_year_range(today: date):
 def _parse_bar_date(bar: dict) -> date:
     return datetime.strptime(bar["datetime"][:10], "%Y-%m-%d").date()
 
-
 def _parse_bar_datetime(bar: dict) -> datetime:
     raw = bar["datetime"]
     if len(raw) > 10:
         return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
     return datetime.strptime(raw, "%Y-%m-%d")
 
-
 def _filter_by_range(bars, start: date, end: date):
     return [b for b in bars if start <= _parse_bar_date(b) <= end]
-
 
 def _bar_close(bar: dict) -> float:
     close_val = bar.get("close")
@@ -710,7 +544,6 @@ def _bar_close(bar: dict) -> float:
         except (TypeError, ValueError):
             pass
     return (float(bar["high"]) + float(bar["low"])) / 2
-
 
 def _aggregate_daily_to_weekly(daily_bars):
     weeks = {}
@@ -741,25 +574,21 @@ def _aggregate_daily_to_weekly(daily_bars):
         })
     return result
 
-
 CRYPTO_BASES = {
     "BTC", "ETH", "XRP", "LTC", "BCH", "ADA", "SOL", "DOGE", "DOT", "MATIC",
     "BNB", "AVAX", "LINK", "TRX", "SHIB", "ATOM", "UNI", "XLM", "ETC", "FIL",
     "APT", "ARB", "OP", "NEAR", "ICP", "AAVE", "SAND", "MANA", "ALGO", "VET",
 }
 
-
 def _is_crypto_symbol(user_symbol: str) -> bool:
     normalized = normalize_symbol(user_symbol)
     base = normalized.split("/")[0].upper()
     return base in CRYPTO_BASES
 
-
 def _filter_weekend_bars_if_not_crypto(bars, user_symbol: str):
     if _is_crypto_symbol(user_symbol):
         return bars
     return [b for b in bars if _parse_bar_date(b).weekday() < 5]
-
 
 def _last_completed_day_bars(bars, today: date):
     completed = [b for b in bars if _parse_bar_date(b) < today]
@@ -767,7 +596,6 @@ def _last_completed_day_bars(bars, today: date):
         return []
     latest = max(_parse_bar_date(b) for b in completed)
     return [b for b in completed if _parse_bar_date(b) == latest]
-
 
 def _levels_from_bars(bars, birim: str = "gün") -> dict:
     if not bars:
@@ -795,9 +623,9 @@ def _levels_from_bars(bars, birim: str = "gün") -> dict:
 
     uyari = None
     if destek2 < 0:
-        uyari = "⚠️ Bu dönem çok oynak; Destek 2 matematiksel olarak negatif çıktı (fiyatta gerçekleşemez)."
+        uyari = "⚠️ Bu dönem çok oynak; Destek 2 matematiksel olarak negatif çıktı."
     elif destek1 < 0:
-        uyari = "⚠️ Bu dönem çok oynak; Destek 1 matematiksel olarak negatif çıktı (fiyatta gerçekleşemez)."
+        uyari = "⚠️ Bu dönem çok oynak; Destek 1 matematiksel olarak negatif çıktı."
 
     return {
         "denge": denge,
@@ -815,19 +643,16 @@ def _levels_from_bars(bars, birim: str = "gün") -> dict:
         "uyari": uyari,
     }
 
-
 def _compute_short_daily_outputsize(today: date) -> int:
     month_start, _ = get_last_completed_month_range(today)
     days_needed = (today - month_start).days + 7
     return max(15, min(days_needed, MAX_SHORT_DAILY_BARS))
-
 
 def _compute_long_weekly_outputsize(today: date) -> int:
     year_start, _ = get_last_completed_year_range(today)
     days_needed = (today - year_start).days
     weeks_needed = (days_needed // 7) + 3
     return max(30, min(weeks_needed, MAX_LONG_WEEKLY_BARS))
-
 
 def calculate_all_periods(user_symbol: str) -> dict:
     today = datetime.now(TR_TZ).date()
@@ -853,7 +678,7 @@ def calculate_all_periods(user_symbol: str) -> dict:
     except Exception as e:
         results["4 Saatlik"] = {"hata": str(e)}
 
-    # --- Günlük, Haftalık, Aylık (günlük mumlar) ---
+    # --- Günlük, Haftalık, Aylık ---
     try:
         short_size = _compute_short_daily_outputsize(today)
         daily_bars = fetch_bars(user_symbol, "1day", short_size)
@@ -898,7 +723,7 @@ def calculate_all_periods(user_symbol: str) -> dict:
         except Exception as e:
             results["Aylık"] = {"hata": str(e)}
 
-    # --- 6 Aylık, Yıllık (haftalık mumlar) ---
+    # --- 6 Aylık, Yıllık ---
     try:
         long_size = _compute_long_weekly_outputsize(today)
         weekly_bars = fetch_bars(user_symbol, "1week", long_size)
@@ -937,163 +762,4 @@ def calculate_all_periods(user_symbol: str) -> dict:
 # ----------------------------------------------------------------------------
 
 PERIOD_ICONS = {
-    "4 Saatlik": "🕓",
-    "Günlük": "🕐",
-    "Haftalık": "📅",
-    "Aylık": "🗓️",
-    "6 Aylık": "📈",
-    "Yıllık": "🏆",
-}
-
-CONFIRMATION_NOTES = {
-    "4 Saatlik": "2 adet 30 dakikalık kapanış",
-    "Günlük": "2 adet 1 saatlik kapanış",
-    "Haftalık": "2 adet 4 saatlik kapanış",
-    "Aylık": "2 adet günlük kapanış",
-    "6 Aylık": "2 adet aylık kapanış",
-    "Yıllık": "2 adet 6 aylık kapanış",
-}
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "✨ *Denge Aralığı Botu* ✨\n\n"
-        "Bana bir enstrüman kodu gönder (örn: *BTCUSD*, *XAUUSD*, *XAGUSD*, *XPTUSD*, "
-        "*XPDUSD*, *EURUSD*, *DXY*, *VIX*, *XU100*, *XU030*, *XU500*, *XAUTRYG*).\n\n"
-        "🕐 Günlük  📅 Haftalık  🗓️ Aylık  📈 6 Aylık  🏆 Yıllık\n"
-        "için Denge (Medyan), Aritmetik Ortalama, Direnç 1/2 ve Destek 1/2 "
-        "seviyelerini hesaplayayım.\n\n"
-        "_Yalnızca TAMAMLANMIŞ (kapanmış) son periyot kullanılır._\n"
-        "_6 Aylık ve Yıllık, API kredi limiti nedeniyle haftalık mumlarla hesaplanır._",
-        parse_mode="Markdown",
-    )
-
-
-def _format_tr_date(iso_date: str) -> str:
-    d = datetime.strptime(iso_date, "%Y-%m-%d").date()
-    return d.strftime("%d.%m.%Y")
-
-
-# Telegram'ın eski "Markdown" modu _..._ / *...* / `...` / [...] karakterlerini
-# biçimlendirme olarak yorumluyor. Hata mesajları ham exception metni
-# (ör. dış API'lerden gelen JSON) içerebildiği için içlerinde bu karakterler
-# geçtiğinde (özellikle '_' -> "api_timeframe" gibi) entity'ler eşleşmez ve
-# Telegram "Can't parse entities" hatasıyla mesajı tümden reddeder. Bu yüzden
-# mesaj gövdesine gömülen HER dinamik/harici metin önce kaçışlanır.
-_MARKDOWN_ESCAPE_CHARS = ("_", "*", "`", "[")
-
-
-def _escape_markdown(text: str) -> str:
-    text = str(text)
-    for ch in _MARKDOWN_ESCAPE_CHARS:
-        text = text.replace(ch, "\\" + ch)
-    return text
-
-
-def format_period_block(period_name: str, result: dict) -> str:
-    icon = PERIOD_ICONS.get(period_name, "•")
-
-    if "hata" in result:
-        return f"{icon} *{period_name}*\n⚠️ _{_escape_markdown(result['hata'])}_"
-
-    birim_etiketi = f"{result['adet']} {result['birim']} verisiyle hesaplandı"
-    tarih_araligi = f"{_format_tr_date(result['baslangic'])} → {_format_tr_date(result['bitis'])}"
-
-    def row(label: str, value: float, emoji: str = "") -> str:
-        full_label = f"{emoji} {label}" if emoji else label
-        return f"{full_label:<11}{value:>11,.2f}"
-
-    table = "\n".join([
-        row("Direnç 2", result["direnc2"], "🔴"),
-        row("Direnç 1", result["direnc1"], "🔴"),
-        "─" * 22,
-        row("Denge", result["denge"], "🟣"),
-        row("Ortalama", result["ortalama"], "🟢"),
-        "─" * 22,
-        row("Destek 1", result["destek1"], "🔵"),
-        row("Destek 2", result["destek2"], "🔵"),
-    ])
-
-    lines = [
-        f"{icon} *{period_name}*",
-        f"_{birim_etiketi}_",
-        f"_📆 Geçerlilik: {tarih_araligi}_",
-        f"```\n{table}\n```",
-    ]
-
-    if result["mod"]:
-        mod_str = ", ".join(f"{v:,.2f}" for v in result["mod"])
-        lines.append(f"🔁 _Mod (tekrarlayan seviye): {mod_str}_")
-
-    if result.get("uyari"):
-        lines.append(f"_{result['uyari']}_")
-
-    confirmation_note = CONFIRMATION_NOTES.get(period_name)
-    if confirmation_note:
-        lines.append(f"📌 _Onay: {confirmation_note}, Denge'nin üstünde ya da altında kapanmalı_")
-
-    return "\n".join(lines)
-
-
-def _format_current_price_line(guncel_fiyat, guncel_fiyat_zaman):
-    if guncel_fiyat is None:
-        return None
-    zaman_str = ""
-    if guncel_fiyat_zaman is not None:
-        if guncel_fiyat_zaman.time() == guncel_fiyat_zaman.min.time():
-            zaman_str = guncel_fiyat_zaman.strftime("%d.%m.%Y")
-        else:
-            zaman_str = guncel_fiyat_zaman.strftime("%d.%m.%Y %H:%M")
-    fiyat_str = f"{guncel_fiyat:,.2f}"
-    if zaman_str:
-        return f"💵 *Güncel Fiyat:* `{fiyat_str}`  _({zaman_str} itibarıyla)_"
-    return f"💵 *Güncel Fiyat:* `{fiyat_str}`"
-
-
-async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_symbol = update.message.text.strip()
-    processing_msg = await update.message.reply_text(f"⏳ {user_symbol.upper()} hesaplanıyor...")
-
-    results = calculate_all_periods(user_symbol)
-    guncel_fiyat_satiri = _format_current_price_line(
-        results.pop("_guncel_fiyat", None), results.pop("_guncel_fiyat_zaman", None)
-    )
-
-    separator = "━" * 24
-    header_blocks = [f"💰 *{_escape_markdown(user_symbol.upper())}*"]
-    if guncel_fiyat_satiri:
-        header_blocks.append(guncel_fiyat_satiri)
-    header_blocks.append(separator)
-
-    blocks = header_blocks + [""]
-    for i, period_name in enumerate(PERIOD_NAMES):
-        blocks.append(format_period_block(period_name, results.get(period_name, {"hata": "sonuç yok"})))
-        if i < len(PERIOD_NAMES) - 1:
-            blocks.append("")
-
-    message = "\n".join(blocks).strip()
-
-    if len(message) <= 4000:
-        await processing_msg.edit_text(message, parse_mode="Markdown")
-    else:
-        await processing_msg.delete()
-        await update.message.reply_text("\n".join(header_blocks), parse_mode="Markdown")
-        for period_name in PERIOD_NAMES:
-            block = format_period_block(period_name, results.get(period_name, {"hata": "sonuç yok"}))
-            await update.message.reply_text(block, parse_mode="Markdown")
-
-
-def main():
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN tanımlı değil. Ortam değişkenlerini kontrol edin.")
-
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_symbol))
-
-    logger.info("Bot başlatıldı, mesajlar bekleniyor...")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+    "4 Saatlik": "🕓
