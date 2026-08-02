@@ -368,11 +368,23 @@ def _normalize_yfinance_symbol(user_symbol: str) -> str:
 
 
 def _yfinance_candidates(user_symbol: str) -> list:
+    """Denenecek Yahoo sembollerini önem sırasına göre döndürür.
+
+    XAG/XPT/XPD gibi metaller için Yahoo'da doğrudan bir forex sembolü
+    (ör. 'XAGUSD=X') hiçbir zaman bulunmuyor ('possibly delisted' hatası
+    kesin geliyor); bu yüzden bu semboller için normalize edilmiş forex
+    formatını hiç denemeden doğrudan bilinen vadeli işlem sembolünü
+    (ör. 'SI=F') ilk sıraya koyuyoruz. Diğer tüm semboller için önce
+    normalize edilmiş format, ardından (varsa) vadeli işlem yedeği denenir.
+    """
     normalized_input = user_symbol.strip().upper().replace(" ", "")
-    candidates = [_normalize_yfinance_symbol(user_symbol)]
-    if normalized_input in YFINANCE_FUTURES_FALLBACK:
-        candidates.append(YFINANCE_FUTURES_FALLBACK[normalized_input])
-    return candidates
+    futures_symbol = YFINANCE_FUTURES_FALLBACK.get(normalized_input)
+
+    if futures_symbol is not None:
+        # Bu sembollerde forex tickerı hiç çalışmadığı için doğrudan vadeliyle başla.
+        return [futures_symbol]
+
+    return [_normalize_yfinance_symbol(user_symbol)]
 
 
 def _yf_history_with_retry(candidate: str, period: str, interval: str):
