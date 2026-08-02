@@ -752,5 +752,4 @@ def calculate_all_periods(user_symbol: str) -> dict:
         except Exception as e:
             results["Yıllık"] = {"hata": str(e)}
 
-    results["_guncel_fiyat"] = guncel_fiyat
-    results["_guncel
+    results["_guncel_fiy
