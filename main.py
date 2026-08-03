@@ -290,117 +290,8 @@ def fetch_bars_bist_index(user_symbol: str, interval: str, outputsize: int):
 
 
 # ----------------------------------------------------------------------------
-# VERİ ÇEKME - YENİ ASIL YEDEK KAYNAK: Binance Futures (TradFi Perpetual
-# Contracts) - XAU/XAG/XPT/XPD için Twelve Data kapalıysa İLK denenen kaynak
-# ----------------------------------------------------------------------------
-# Binance, Ocak 2026'dan itibaren XAUUSDT/XAGUSDT/XPTUSDT/XPDUSDT adında
-# USDT'ye kotalı "TradFi Perpetual" kontratları açtı. Bunlar:
-#   - API key GEREKTİRMİYOR (public endpoint), scraping değil resmi REST API.
-#   - Gerçek OHLC (high/low/close) veriyor - MetalpriceAPI'nin aksine.
-#   - 4 saatlik, günlük VE haftalık mum aralıklarının HEPSİNİ destekliyor -
-#     bu bot için asıl kronik eksik olan 4 saatlik veri sorununu çözüyor.
-#   - Cömert, key gerektirmeyen rate limit (dakikada binlerce ağırlık birimi).
-#
-# ÖNEMLİ KISIT: Bu kontratlar çok yeni (XAU/XAG 7-8 Ocak 2026, XPT/XPD 30
-# Ocak 2026'da açıldı), yani geçmişleri sadece birkaç ay. Bu yüzden bu kaynak
-# SADECE "4h" ve "1day" aralıkları için fetch_bars() fallback zincirine
-# dahil ediliyor (bkz. fetch_bars() içindeki fallback_sources listesi).
-# "1week" (6 Aylık/Yıllık'ın kaynağı) için kullanılmıyor - kontratların ömrü
-# tam bir yılı kapsamadığından, MetalpriceAPI'de daha önce düzelttiğimiz
-# "yetersiz veriyle sessizce yanlış sonuç üretme" hatasına düşmemek için
-# bu aralık bilinçli olarak eski Stooq/yfinance zincirine bırakıldı.
-
-BINANCE_FUTURES_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
-
-BINANCE_SYMBOL_MAP = {
-    "XAUUSD": "XAUUSDT",  # Altın
-    "XAGUSD": "XAGUSDT",  # Gümüş
-    "XPTUSD": "XPTUSDT",  # Platin
-    "XPDUSD": "XPDUSDT",  # Paladyum
-}
-
-# Bu bot içindeki interval isimlerinden Binance'in kendi interval isimlerine
-# eşleme. Bilinçli olarak sadece "4h" ve "1day" fetch_bars() zincirinde
-# kullanılıyor (yukarıdaki NOT'a bakın); "1week" burada yine de haritalanmış
-# durumda (ileride ihtiyaç olursa doğrudan çağrılabilsin diye) ama şu anki
-# fallback_sources listesine dahil edilmiyor.
-BINANCE_INTERVAL_MAP = {"4h": "4h", "1day": "1d", "1week": "1w"}
-
-
-def _fetch_bars_binance_uncached(user_symbol: str, interval: str, outputsize: int):
-    normalized_input = user_symbol.strip().upper().replace(" ", "")
-    binance_symbol = BINANCE_SYMBOL_MAP.get(normalized_input)
-    if binance_symbol is None:
-        raise ValueError(f"Binance '{user_symbol}' sembolünü desteklemiyor.")
-
-    binance_interval = BINANCE_INTERVAL_MAP.get(interval)
-    if binance_interval is None:
-        raise ValueError(f"Binance kaynağında '{interval}' aralığı desteklenmiyor.")
-
-    params = {
-        "symbol": binance_symbol,
-        "interval": binance_interval,
-        # Binance'in limit üst sınırı 1500; outputsize 0 ya da negatif gelirse
-        # yine de en az 1 mum istenmiş olsun.
-        "limit": min(max(outputsize, 1), 1500),
-    }
-
-    try:
-        resp = requests.get(
-            BINANCE_FUTURES_KLINES_URL, params=params, headers=BROWSER_HEADERS, timeout=15
-        )
-    except Exception as e:
-        raise ValueError(f"Binance'e bağlanılamadı: {e}")
-
-    # 429 = rate limit aşıldı, 418 = IP geçici olarak banlandı (Binance'e özgü).
-    if resp.status_code in (429, 418):
-        raise ValueError(
-            "Binance şu anda istek limiti uyguluyor (Too Many Requests). "
-            "Lütfen birkaç dakika sonra tekrar deneyin."
-        )
-
-    try:
-        data = resp.json()
-    except Exception as e:
-        raise ValueError(f"Binance yanıtı ayrıştırılamadı: {e}")
-
-    if not isinstance(data, list):
-        # Binance hata durumunda {"code": ..., "msg": ...} formatında JSON döner.
-        msg = data.get("msg", str(data)) if isinstance(data, dict) else str(data)
-        raise ValueError(f"Binance hata: {msg} (sembol: {binance_symbol})")
-
-    bars = []
-    for row in data:
-        try:
-            open_time_ms = row[0]
-            dt = datetime.utcfromtimestamp(open_time_ms / 1000)
-            # 4 saatlik barlarda saat bilgisi korunur (gün içi karşılaştırma
-            # için gerekli); günlük/haftalık barlarda sadece tarih yeterli.
-            dt_str = dt.strftime("%Y-%m-%d %H:%M:%S") if interval == "4h" else dt.strftime("%Y-%m-%d")
-            bars.append({
-                "datetime": dt_str,
-                "high": float(row[2]),
-                "low": float(row[3]),
-                "close": float(row[4]),
-            })
-        except (IndexError, TypeError, ValueError):
-            continue
-
-    if not bars:
-        raise ValueError(f"Binance: '{user_symbol}' için ayrıştırılabilir veri bulunamadı.")
-
-    return bars[-outputsize:] if len(bars) > outputsize else bars
-
-
-def fetch_bars_binance(user_symbol: str, interval: str, outputsize: int):
-    """Binance çağrısını kısa süreli önbellekle sarmalar (rate limit'i azaltmak için)."""
-    cache_key = f"binance:{user_symbol.strip().upper()}:{interval}:{outputsize}"
-    return _cached_fetch(cache_key, lambda: _fetch_bars_binance_uncached(user_symbol, interval, outputsize))
-
-
-# ----------------------------------------------------------------------------
-# VERİ ÇEKME - YEDEK KAYNAK: MetalpriceAPI (sadece XAG/XPT/XPD için, Binance
-# ve Twelve Data'dan sonra, Stooq/Yahoo'dan ÖNCE denenir)
+# VERİ ÇEKME - YEDEK KAYNAK: MetalpriceAPI (sadece XAG/XPT/XPD için, Twelve
+# Data kapalıysa Stooq/Yahoo'dan ÖNCE denenir)
 # ----------------------------------------------------------------------------
 # metalpriceapi.com, API key ile çalışan gerçek bir servistir (scraping
 # değildir), bu yüzden Stooq/Yahoo'nun yaşadığı "bot sanılıp engellenme"
@@ -408,9 +299,6 @@ def fetch_bars_binance(user_symbol: str, interval: str, outputsize: int):
 # tek bir "timeframe" isteğiyle (365 güne kadar) hem günlük hem haftalık
 # ihtiyacı karşılıyoruz (haftalık barlar günlük veriden yerel olarak
 # toplanıyor), kotayı en verimli şekilde kullanmak için.
-# NOT: Binance eklendiğinden beri bu kaynak XAU için hiç kullanılmıyor
-# (Binance XAUUSDT karşılıyor), sadece Binance'in kendisi başarısız olursa
-# XAG/XPT/XPD için ikinci basamak yedek olarak devrede.
 
 METALPRICEAPI_URL = "https://api.metalpriceapi.com/v1/timeframe"
 
@@ -771,11 +659,6 @@ def fetch_bars(user_symbol: str, interval: str, outputsize: int):
     logger.info(f"🔄 '{user_symbol}' Twelve Data ücretsiz planda kapalı, yedek kaynaklar deneniyor...")
 
     fallback_sources = []
-    # Binance en iyi kaynak (gerçek OHLC, 4 saatlik dahil, key gerektirmiyor)
-    # ama kontratların geçmişi kısa olduğundan SADECE 4h/1day için denenir;
-    # "1week" (6 Aylık/Yıllık) eski Stooq/yfinance zincirine bırakılır.
-    if normalized_input in BINANCE_SYMBOL_MAP and interval in ("4h", "1day"):
-        fallback_sources.append(("Binance", fetch_bars_binance))
     if normalized_input in METALPRICEAPI_SYMBOL_MAP and METALPRICEAPI_KEY:
         fallback_sources.append(("MetalpriceAPI", fetch_bars_metalpriceapi))
     fallback_sources.append(("Stooq", fetch_bars_stooq))
